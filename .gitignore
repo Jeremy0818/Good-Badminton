@@ -28,3 +28,6 @@ weights/*
 Thumbs.db
 .idea/
 .vscode/
+
+# Downloaded datasets
+data/
