@@ -1,0 +1,425 @@
+"""Shuttlecock line calls from an existing analysis run.
+
+Reads ``metadata.json`` and ``detections.jsonl`` written by the main pipeline,
+splits the video into rallies from shuttle motion (fixed-camera friendly: no
+camera cuts needed), finds where the last shot of each rally landed and calls
+it in or out against the singles or doubles boundary.
+
+Run it again on an existing output directory without re-processing the video:
+
+    python -m badminton_analysis.analysis.line_calls outputs/<video_name> --match-type singles
+"""
+
+import argparse
+import json
+import os
+from dataclasses import asdict, dataclass, field
+
+import numpy as np
+
+from ..court.mapper import CourtMapper
+from ..court.reference import (
+    BADMINTON_COURT_LENGTH,
+    BADMINTON_COURT_WIDTH,
+    BADMINTON_SINGLES_MARGIN,
+)
+
+
+NET_Y = BADMINTON_COURT_LENGTH / 2.0
+SIDE_LABELS = {"upper": "far", "lower": "near"}
+
+
+@dataclass
+class LineCallConfig:
+    match_type: str = "singles"
+    # Speeds and distances in screen heights, so thresholds hold across resolutions.
+    move_speed: float = 0.25        # faster than this (per second) = shuttle in flight
+    still_radius: float = 0.015     # settled shuttle stays within this radius
+    max_link_gap: float = 0.25      # seconds; larger detection gaps are not used for speed
+    merge_gap: float = 0.6          # seconds; flight pieces closer than this form one rally
+    top_exit_margin: float = 0.05   # flight last seen this close to the top edge = high shot above the frame
+    offscreen_gap: float = 3.0      # seconds a high shot may stay above the frame without ending the rally
+    min_rally_duration: float = 0.5
+    min_rally_points: int = 6
+    settle_window: float = 1.5      # seconds after the last flight sample to look for the landing
+    settle_points: int = 3
+    hand_radius: float = 0.06       # settled shuttle this close to a hand = held, not landed
+    close_call_margin: float = 0.15  # meters from a line that counts as a close call
+    net_margin: float = 0.3          # meters from the net where the landing side is uncertain
+
+
+@dataclass
+class RallyCall:
+    rally: int
+    start_frame: int
+    end_frame: int
+    start_sec: float
+    end_sec: float
+    landing_frame: int = None
+    landing_detect_frame: int = None
+    landing_image: list = None
+    landing_court: list = None
+    landing_side: str = None
+    call: str = "unknown"
+    margin_m: float = None
+    landing_method: str = None
+    confidence: str = "low"
+    flags: list = field(default_factory=list)
+
+
+def court_bounds(match_type):
+    """Return (x_min, x_max, y_min, y_max) in meters for rally play."""
+    if match_type == "doubles":
+        return 0.0, BADMINTON_COURT_WIDTH, 0.0, BADMINTON_COURT_LENGTH
+    if match_type == "singles":
+        return (
+            BADMINTON_SINGLES_MARGIN,
+            BADMINTON_COURT_WIDTH - BADMINTON_SINGLES_MARGIN,
+            0.0,
+            BADMINTON_COURT_LENGTH,
+        )
+    raise ValueError(f"Unknown match type: {match_type}")
+
+
+def call_landing(court_point, match_type):
+    """Call a landing point in or out.
+
+    Returns (call, margin_m). The margin is the signed distance to the nearest
+    boundary line: positive inside the court, negative outside. A shuttle on
+    the line is in, so zero counts as in.
+    """
+    x_min, x_max, y_min, y_max = court_bounds(match_type)
+    x, y = float(court_point[0]), float(court_point[1])
+    margin = min(x - x_min, x_max - x, y - y_min, y_max - y)
+    return ("in" if margin >= 0 else "out"), round(margin, 3)
+
+
+def load_run(output_dir):
+    with open(os.path.join(output_dir, "metadata.json"), "r", encoding="utf-8") as file:
+        metadata = json.load(file)
+    detections_path = metadata.get("outputs", {}).get("detections") or os.path.join(output_dir, "detections.jsonl")
+    if not os.path.exists(detections_path):
+        detections_path = os.path.join(output_dir, "detections.jsonl")
+    records = []
+    with open(detections_path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return metadata, records
+
+
+def _shuttle_samples(records, fps):
+    samples = []
+    for record in records:
+        point = (record.get("shuttlecock") or {}).get("image")
+        if not point:
+            continue
+        time_sec = record.get("time_sec")
+        if time_sec is None:
+            time_sec = record["frame"] / fps
+        samples.append({
+            "frame": int(record["frame"]),
+            "detect_frame": int(record.get("detect_frame", record["frame"])),
+            "t": float(time_sec),
+            "p": np.array(point[:2], dtype=float),
+        })
+    return samples
+
+
+def _hand_points(record):
+    points = []
+    for player in (record.get("players") or {}).values():
+        if not player:
+            continue
+        for hand in (player.get("hands") or {}).values():
+            if hand:
+                points.append(np.array(hand[:2], dtype=float))
+    return points
+
+
+def find_rallies(samples, frame_height, config):
+    """Group shuttle samples into rallies. Returns (first_index, last_index) of flight samples."""
+    move_px = config.move_speed * frame_height
+    moving = []
+    for i in range(1, len(samples)):
+        dt = samples[i]["t"] - samples[i - 1]["t"]
+        if dt <= 0 or dt > config.max_link_gap:
+            continue
+        speed = np.linalg.norm(samples[i]["p"] - samples[i - 1]["p"]) / dt
+        if speed > move_px:
+            moving.append(i)
+
+    top_exit_px = config.top_exit_margin * frame_height
+    groups = []
+    for i in moving:
+        if groups:
+            last_seen = samples[groups[-1][-1]]
+            # A clear or lob often leaves the top of the frame; that is not the end of the rally.
+            allowed_gap = config.offscreen_gap if last_seen["p"][1] < top_exit_px else config.merge_gap
+        if groups and samples[i]["t"] - last_seen["t"] <= allowed_gap:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+
+    rallies = []
+    for group in groups:
+        first = max(0, group[0] - 1)
+        last = group[-1]
+        duration = samples[last]["t"] - samples[first]["t"]
+        if duration >= config.min_rally_duration and len(group) >= config.min_rally_points:
+            rallies.append((first, last))
+    return rallies
+
+
+def _find_settle(samples, start, stop, end_t, frame_height, config):
+    """Find the first run of samples where the shuttle sits still after flight."""
+    radius = config.still_radius * frame_height
+    for j in range(start, stop):
+        if samples[j]["t"] - end_t > config.settle_window:
+            break
+        run = [j]
+        for k in range(j + 1, stop):
+            if samples[k]["t"] - samples[run[-1]]["t"] > config.max_link_gap:
+                break
+            if np.linalg.norm(samples[k]["p"] - samples[j]["p"]) > radius:
+                break
+            run.append(k)
+        if len(run) >= config.settle_points:
+            return run
+    return None
+
+
+def compute_line_calls(metadata, records, config=None):
+    config = config or LineCallConfig()
+    fps = float(metadata["video"]["fps"])
+    frame_height = float(metadata["video"]["height"])
+    mapper = CourtMapper([tuple(corner) for corner in metadata["court"]["corners"]])
+    records_by_frame = {int(record["frame"]): record for record in records}
+
+    samples = _shuttle_samples(records, fps)
+    rallies = find_rallies(samples, frame_height, config)
+
+    calls = []
+    for index, (first, last) in enumerate(rallies):
+        next_start = rallies[index + 1][0] if index + 1 < len(rallies) else len(samples)
+        rally = RallyCall(
+            rally=index + 1,
+            start_frame=samples[first]["frame"],
+            end_frame=samples[last]["frame"],
+            start_sec=round(samples[first]["t"], 3),
+            end_sec=round(samples[last]["t"], 3),
+        )
+
+        settle = _find_settle(samples, last, next_start, samples[last]["t"], frame_height, config)
+        if settle:
+            point = np.median([samples[k]["p"] for k in settle], axis=0)
+            landing_sample = samples[settle[0]]
+            rally.landing_method = "settled"
+            hand_px = config.hand_radius * frame_height
+            for k in settle:
+                hands = _hand_points(records_by_frame.get(samples[k]["frame"], {}))
+                if any(np.linalg.norm(samples[k]["p"] - hand) < hand_px for hand in hands):
+                    rally.landing_method = "held"
+                    rally.flags.append("shuttle still near a player's hand: caught or picked up, not a floor landing")
+                    break
+        else:
+            point = samples[last]["p"]
+            landing_sample = samples[last]
+            rally.landing_method = "last_seen"
+            rally.flags.append("shuttle lost before it settled: landing taken from last flight position")
+
+        court_point = mapper.image_to_court([float(point[0]), float(point[1])])
+        rally.landing_frame = landing_sample["frame"]
+        rally.landing_detect_frame = landing_sample["detect_frame"]
+        rally.landing_image = [round(float(point[0]), 1), round(float(point[1]), 1)]
+        rally.landing_court = [float(court_point[0]), float(court_point[1])]
+        rally.landing_side = "upper" if court_point[1] < NET_Y else "lower"
+        rally.call, rally.margin_m = call_landing(court_point, config.match_type)
+
+        if abs(rally.margin_m) < config.close_call_margin:
+            rally.flags.append(f"close call: {abs(rally.margin_m) * 100:.0f} cm from the line")
+        net_distance = abs(rally.landing_court[1] - NET_Y)
+        if net_distance < config.net_margin:
+            rally.flags.append(f"landed {net_distance * 100:.0f} cm from the net: which side it fell on is uncertain")
+        if rally.landing_method == "settled":
+            rally.confidence = "medium" if abs(rally.margin_m) < config.close_call_margin else "high"
+        calls.append(rally)
+
+    return calls
+
+
+def summarize(calls):
+    counts = {"rallies": len(calls), "in": 0, "out": 0, "needs_review": 0}
+    for rally in calls:
+        if rally.call in ("in", "out"):
+            counts[rally.call] += 1
+        if rally.confidence != "high":
+            counts["needs_review"] += 1
+    return counts
+
+
+def write_report(path, calls, config):
+    report = {
+        "config": asdict(config),
+        "summary": summarize(calls),
+        "rallies": [asdict(rally) for rally in calls],
+    }
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(report, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    return report
+
+
+def draw_landing_map(path, calls, match_type):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from ..court.reference import BADMINTON_BACK_SERVICE_OFFSET, BADMINTON_SERVICE_LINE_FROM_NET
+
+    width, length = BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH
+    margin = BADMINTON_SINGLES_MARGIN
+    fig, ax = plt.subplots(figsize=(5, 9))
+    ax.set_facecolor("#2f6b3a")
+    line = {"color": "white", "linewidth": 1.4}
+    ax.plot([0, width, width, 0, 0], [0, 0, length, length, 0], **line)
+    for x in (margin, width - margin):
+        ax.plot([x, x], [0, length], **line)
+    for y in (BADMINTON_BACK_SERVICE_OFFSET, length - BADMINTON_BACK_SERVICE_OFFSET,
+              NET_Y - BADMINTON_SERVICE_LINE_FROM_NET, NET_Y + BADMINTON_SERVICE_LINE_FROM_NET):
+        ax.plot([0, width], [y, y], **line)
+    ax.plot([width / 2, width / 2], [0, NET_Y - BADMINTON_SERVICE_LINE_FROM_NET], **line)
+    ax.plot([width / 2, width / 2], [NET_Y + BADMINTON_SERVICE_LINE_FROM_NET, length], **line)
+    ax.plot([-0.3, width + 0.3], [NET_Y, NET_Y], color="#dddddd", linewidth=3)
+
+    for rally in calls:
+        if rally.landing_court is None:
+            continue
+        x, y = rally.landing_court
+        color = "#2ecc71" if rally.call == "in" else "#e74c3c"
+        filled = rally.confidence == "high"
+        ax.scatter([x], [y], s=90, facecolors=color if filled else "none", edgecolors=color, linewidths=2, zorder=3)
+        ax.annotate(str(rally.rally), (x, y), xytext=(6, 4), textcoords="offset points", color="white", fontsize=8)
+
+    ax.set_xlim(-1.5, width + 1.5)
+    ax.set_ylim(length + 1.5, -1.5)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(f"Landing points ({match_type})\ngreen = in, red = out, hollow = needs review", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def render_line_call_video(source_video, output_path, calls, fps, use_detect_frames, hold_seconds=2.0):
+    """Draw each landing point and its call onto a copy of the video."""
+    import cv2
+
+    from ..media.video_audio import encode_vscode_compatible_mp4
+
+    hold_frames = int(fps * hold_seconds)
+    markers = {}
+    for rally in calls:
+        start = rally.landing_detect_frame if use_detect_frames else rally.landing_frame
+        if start is None:
+            continue
+        for frame_index in range(start, start + hold_frames):
+            markers[frame_index] = rally
+
+    cap = cv2.VideoCapture(source_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {source_video}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    temp_path = output_path + ".tmp.mp4"
+    writer = cv2.VideoWriter(temp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    frame_index = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_index += 1
+        rally = markers.get(frame_index)
+        if rally is not None:
+            color = (80, 200, 60) if rally.call == "in" else (60, 60, 230)
+            x, y = int(rally.landing_image[0]), int(rally.landing_image[1])
+            cv2.circle(frame, (x, y), 18, color, 3, cv2.LINE_AA)
+            label = f"Rally {rally.rally}: {rally.call.upper()} ({rally.margin_m * 100:+.0f} cm)"
+            if rally.confidence != "high":
+                label += " ?"
+            cv2.rectangle(frame, (20, height - 70), (20 + 18 * len(label), height - 20), (0, 0, 0), -1)
+            cv2.putText(frame, label, (32, height - 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
+        writer.write(frame)
+
+    cap.release()
+    writer.release()
+    try:
+        encode_vscode_compatible_mp4(temp_path, output_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def run_line_calls(output_dir, match_type="singles", render_video=False, config=None):
+    """Compute line calls for an output directory and write the report files."""
+    config = config or LineCallConfig(match_type=match_type)
+    metadata, records = load_run(output_dir)
+    calls = compute_line_calls(metadata, records, config)
+
+    report_path = os.path.join(output_dir, "line_calls.json")
+    report = write_report(report_path, calls, config)
+    map_path = os.path.join(output_dir, "line_calls_map.png")
+    draw_landing_map(map_path, calls, config.match_type)
+
+    video_path = None
+    if render_video:
+        annotated = metadata.get("outputs", {}).get("video")
+        use_detect_frames = bool(annotated and os.path.exists(annotated))
+        source = annotated if use_detect_frames else metadata["video"]["path"]
+        video_path = os.path.join(output_dir, f"line_calls_{metadata['video']['name']}.mp4")
+        render_line_call_video(source, video_path, calls, float(metadata["video"]["fps"]), use_detect_frames)
+
+    print_summary(calls)
+    print(f"Line call report: {report_path}")
+    print(f"Landing map: {map_path}")
+    if video_path:
+        print(f"Line call video: {video_path}")
+    return report
+
+
+def print_summary(calls):
+    print(f"\nLine calls: {len(calls)} rallies")
+    for rally in calls:
+        side = SIDE_LABELS.get(rally.landing_side, "?")
+        margin = f"{rally.margin_m * 100:+.0f} cm" if rally.margin_m is not None else "-"
+        print(f"  #{rally.rally:<3} {rally.start_sec:7.2f}s-{rally.end_sec:7.2f}s  "
+              f"{rally.call.upper():<4} {margin:>8}  {side:<4} side  "
+              f"[{rally.confidence}, {rally.landing_method}]")
+        for flag in rally.flags:
+            print(f"        - {flag}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Call shuttlecock landings in or out from an analysis output directory")
+    parser.add_argument("output_dir", help="Analysis output directory, e.g. outputs/<video_name>")
+    parser.add_argument("--match-type", choices=["singles", "doubles"], default="singles")
+    parser.add_argument("--video", action="store_true", help="Also render a video with landing points and calls")
+    parser.add_argument("--close-call-margin", type=float, default=LineCallConfig.close_call_margin,
+                        help="Meters from a line that flags a call for review")
+    parser.add_argument("--move-speed", type=float, default=LineCallConfig.move_speed,
+                        help="Shuttle speed (screen heights per second) treated as flight")
+    args = parser.parse_args()
+
+    config = LineCallConfig(
+        match_type=args.match_type,
+        close_call_margin=args.close_call_margin,
+        move_speed=args.move_speed,
+    )
+    run_line_calls(args.output_dir, render_video=args.video, config=config)
+
+
+if __name__ == "__main__":
+    main()

@@ -259,7 +259,26 @@ RTMPose / RTMO modes:
 --visualize-positions true|false     Generate heatmaps and scatter plots, default true
 --audio true|false                   Keep original video audio, default true
 --language {zh,en}                   Visualization language
+--line-calls true|false              Call each rally's landing in or out (experimental), default false
+--match-type singles|doubles         Court boundary used for line calls, default singles
 ```
+
+### Line Calls (Experimental)
+
+`--line-calls true` finds where the last shot of each rally landed and calls it in or out. Rallies are split from shuttle motion, so it works on fixed-camera recordings with no camera cuts.
+
+- A landing is the point where the shuttle comes to rest on the floor after flight. A shuttle that stops next to a player's hand is treated as caught, not landed.
+- A shuttle on the line is in. Each call reports its distance to the nearest boundary line in cm.
+- Calls are flagged for review when the shuttle was lost before it settled, was caught, landed within 15 cm of a line, or landed within 30 cm of the net.
+- Outputs: `line_calls.json`, `line_calls_map.png` (landing points on a court diagram), and `line_calls_<video_name>.mp4` (landing point and call drawn on the video).
+
+Re-run line calls on an existing output directory without re-processing the video:
+
+```bash
+python -m badminton_analysis.analysis.line_calls outputs/<video_name> --match-type singles --video
+```
+
+Single-camera calls are reliable for clear landings. Shots within a few cm of a line, or landings at 25-30 fps where the shuttle is blurred, still need a human check.
 
 ## 📊 Outputs
 

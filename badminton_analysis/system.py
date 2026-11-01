@@ -1,7 +1,5 @@
 ﻿import os
 import tempfile
-from tkinter import filedialog
-import tkinter as tk
 import time
 import argparse
 
@@ -396,6 +394,10 @@ class BadmintonAnalysisSystem:
             return self.template_path
 
         try:
+            # Imported here so runs with --template-path work on Pythons built without Tk.
+            from tkinter import filedialog
+            import tkinter as tk
+
             root = tk.Tk()
             root.withdraw()
             template_path = filedialog.askopenfilename(

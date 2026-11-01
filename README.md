@@ -257,7 +257,26 @@ RTMPose 模型档位：
 --visualize-positions true|false     是否生成热力图和散点图，默认 true
 --audio true|false                   是否保留原视频音频，默认 true
 --language {zh,en}           选择界面语言
+--line-calls true|false      判定每回合落点界内/界外（实验功能），默认 false
+--match-type singles|doubles 界内/界外判定使用单打或双打边界，默认 singles
 ```
+
+### 落点界内/界外判定（实验功能）
+
+`--line-calls true` 会找到每回合最后一拍的落点，并判定界内或界外。回合根据羽毛球运动轨迹划分，因此适用于没有镜头切换的固定机位录像。
+
+- 落点为羽毛球飞行后停在地面上的位置；停在球员手边的球视为被接住，不算落地。
+- 压线算界内。每个判定都会给出到最近边线的距离（厘米）。
+- 以下情况会标记为需要复核：球在落地前丢失、球被接住、落点距边线 15 cm 以内、落点距球网 30 cm 以内。
+- 输出：`line_calls.json`、`line_calls_map.png`（球场示意图上的落点）、`line_calls_<视频名>.mp4`（在视频上标出落点和判定）。
+
+无需重新处理视频，可直接对已有输出目录重新判定：
+
+```bash
+python -m badminton_analysis.analysis.line_calls outputs/<视频名> --match-type singles --video
+```
+
+单机位对清晰的落点判定可靠；距边线仅几厘米的球，或 25-30 fps 下羽毛球模糊的落点，仍需人工复核。
 
 ## 📊 输出结果
 

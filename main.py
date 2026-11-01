@@ -26,6 +26,8 @@ def main():
     parser.add_argument('--visualize-positions', choices=['true', 'false'], default='true', help='是否生成球员位置热力图和散点图，默认 true')
     parser.add_argument('--audio', choices=['true', 'false'], default='true', help='是否保留原视频音频，默认 true')
     parser.add_argument('--language', default='zh', choices=['zh', 'en'], help='选择界面语言 (zh/en)')
+    parser.add_argument('--line-calls', choices=['true', 'false'], default='false', help='是否判定每回合落点界内/界外（实验功能），默认 false')
+    parser.add_argument('--match-type', choices=['singles', 'doubles'], default='singles', help='界内/界外判定使用的单打或双打边界')
     args = parser.parse_args()
 
     load_runtime_dependencies()
@@ -62,6 +64,11 @@ def main():
         print("\n开始生成球员位置可视化...")
         analyze_player_positions(system.detections_path, os.path.join(system.save_dir, 'position_visualizations'), fps=system.fps)
         print("球员位置可视化完成")
+
+    if args.line_calls == 'true':
+        from badminton_analysis.analysis.line_calls import run_line_calls
+        print("\n开始判定落点界内/界外...")
+        run_line_calls(system.save_dir, match_type=args.match_type, render_video=True)
 
 if __name__ == "__main__":
     main()
