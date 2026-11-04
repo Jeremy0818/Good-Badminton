@@ -31,3 +31,7 @@ Thumbs.db
 
 # Downloaded datasets
 data/
+videos/ss_*
+
+# ShuttleSet template frames (stills from broadcast footage)
+templates/shuttleset/

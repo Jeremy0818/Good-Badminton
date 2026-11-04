@@ -27,6 +27,8 @@ def main():
     parser.add_argument('--audio', choices=['true', 'false'], default='true', help='是否保留原视频音频，默认 true')
     parser.add_argument('--language', default='zh', choices=['zh', 'en'], help='选择界面语言 (zh/en)')
     parser.add_argument('--line-calls', choices=['true', 'false'], default='false', help='是否判定每回合落点界内/界外（实验功能），默认 false')
+    parser.add_argument('--start-sec', type=float, default=None, help='从视频第几秒开始分析（之前的帧跳过但计入帧号）')
+    parser.add_argument('--end-sec', type=float, default=None, help='分析到视频第几秒结束')
     parser.add_argument('--match-type', choices=['singles', 'doubles'], default='singles', help='界内/界外判定使用的单打或双打边界')
     args = parser.parse_args()
 
@@ -54,7 +56,9 @@ def main():
         pose_mode=args.pose_mode,
         pose_family=args.pose_family,
         yolo_pose_model=args.yolo_pose_model,
-        show_pose_roi=args.pose_roi == 'true'
+        show_pose_roi=args.pose_roi == 'true',
+        start_sec=args.start_sec,
+        end_sec=args.end_sec,
     )
 
     system.keep_audio = args.audio == 'true'

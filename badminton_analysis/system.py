@@ -64,7 +64,8 @@ class BadmintonAnalysisSystem:
                  save_images=False, language='zh', output_dir=None,
                  ball_model_path='weights/yolo11s-ball.pt', template_path=None,
                  pose_mode='balanced', pose_family='rtmpose',
-                 yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True):
+                 yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
+                 start_sec=None, end_sec=None):
         self.video_path = video_path
         self.show_display = show_display
         self.language = language
@@ -74,6 +75,8 @@ class BadmintonAnalysisSystem:
         self.pose_family = pose_family
         self.yolo_pose_model = yolo_pose_model
         self.show_pose_roi = show_pose_roi
+        self.start_sec = start_sec
+        self.end_sec = end_sec
 
 
         self.show_skeletons = show_skeletons
@@ -214,7 +217,19 @@ class BadmintonAnalysisSystem:
         detect_frame_count = 0
 
 
+        # Frames outside the range are skipped but still counted, so frame numbers and
+        # times in detections.jsonl match the source video.
+        start_frame = int(self.start_sec * fps) if self.start_sec else 0
+        end_frame = int(self.end_sec * fps) if self.end_sec else None
+
         while cap.isOpened():
+            if end_frame is not None and frame_count >= end_frame:
+                break
+            if frame_count < start_frame:
+                if not cap.grab():
+                    break
+                frame_count += 1
+                continue
             ret, frame = cap.read()
             if not ret:
                 break
