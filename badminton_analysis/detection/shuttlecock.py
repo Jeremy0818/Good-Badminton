@@ -4,6 +4,8 @@ import time
 import cv2
 import numpy as np
 
+from ..court.reference import BADMINTON_COURT_LENGTH, BADMINTON_COURT_WIDTH
+
 try:
     import torch
 except Exception:
@@ -25,6 +27,10 @@ class ShuttlecockTracker:
         roi_padding_ratio=0.08,
         max_box_area_ratio=0.004,
         max_aspect_ratio=4.0,
+        static_cell_ratio=0.01,
+        static_min_frames=900,
+        static_min_frames_off_court=150,
+        static_off_court_meters=2.0,
     ):
         self.yolo_ball_model = yolo_ball_model
         self.trajectory_length = trajectory_length
@@ -36,6 +42,19 @@ class ShuttlecockTracker:
         self.roi_padding_ratio = roi_padding_ratio
         self.max_box_area_ratio = max_box_area_ratio
         self.max_aspect_ratio = max_aspect_ratio
+        # Fixed objects the model mistakes for the shuttle (lights, logos) keep producing
+        # candidates in the same small cell. A real shuttle rests in one place for a few
+        # seconds at most, so a cell seen in static_min_frames frames (30 s at 30 fps)
+        # is treated as a fixed object for the rest of the video. Cells that map well
+        # outside the court (stands, lights, boards) are banned sooner, since a flying
+        # shuttle only passes through them for a frame or two.
+        self.static_cell_ratio = static_cell_ratio
+        self.static_min_frames = static_min_frames
+        self.static_min_frames_off_court = static_min_frames_off_court
+        self.static_off_court_meters = static_off_court_meters
+        self.court_mapper = None
+        self.cell_counts = {}
+        self.static_cells = set()
 
         self.shuttlecock_trajectory = deque(maxlen=trajectory_length)
         self.last_valid_position = None
@@ -59,6 +78,7 @@ class ShuttlecockTracker:
             print(f"YOLO shuttlecock inference took {time.time() - t0:.2f} sec")
 
         candidates = self._extract_candidates(ball_results, frame.shape, roi_corners)
+        candidates = self._drop_static_candidates(candidates, frame.shape)
         selected = self._select_candidate(candidates)
         self.last_candidate = selected
         self.last_detection = {
@@ -125,6 +145,46 @@ class ShuttlecockTracker:
             )
 
         return candidates
+
+    def _cell(self, point, frame_shape):
+        size = max(1.0, frame_shape[0] * self.static_cell_ratio)
+        return int(point[0] // size), int(point[1] // size)
+
+    def _meters_outside_court(self, point):
+        if self.court_mapper is None:
+            return 0.0
+        x, y = self.court_mapper.image_to_court([float(point[0]), float(point[1])])
+        return max(-x, x - BADMINTON_COURT_WIDTH, -y, y - BADMINTON_COURT_LENGTH, 0.0)
+
+    def _drop_static_candidates(self, candidates, frame_shape):
+        cells = {self._cell(candidate["point"], frame_shape): candidate["point"] for candidate in candidates}
+        for cell, point in cells.items():
+            count = self.cell_counts.get(cell, 0) + 1
+            self.cell_counts[cell] = count
+            if cell in self.static_cells:
+                continue
+            banned = count >= self.static_min_frames or (
+                count >= self.static_min_frames_off_court
+                and self._meters_outside_court(point) > self.static_off_court_meters
+            )
+            if banned:
+                self.static_cells.add(cell)
+                # The track has likely been locked onto this object; start over.
+                self.shuttlecock_trajectory.clear()
+                self.last_valid_position = None
+        if not self.static_cells:
+            return candidates
+
+        def near_static(candidate):
+            x, y = self._cell(candidate["point"], frame_shape)
+            # The object's detections jitter across cell borders, so neighbours count too.
+            return any((x + dx, y + dy) in self.static_cells for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+
+        return [candidate for candidate in candidates if not near_static(candidate)]
+
+    def get_static_spots(self, frame_shape):
+        size = max(1.0, frame_shape[0] * self.static_cell_ratio)
+        return [[(x + 0.5) * size, (y + 0.5) * size] for x, y in sorted(self.static_cells)]
 
     def _select_candidate(self, candidates):
         if not candidates:

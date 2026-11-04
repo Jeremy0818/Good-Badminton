@@ -46,6 +46,9 @@ class LineCallConfig:
     hand_radius: float = 0.06       # settled shuttle this close to a hand = held, not landed
     close_call_margin: float = 0.15  # meters from a line that counts as a close call
     net_margin: float = 0.3          # meters from the net where the landing side is uncertain
+    static_cell: float = 0.01        # grid cell size for finding fixed false detections
+    static_share: float = 0.02       # a cell holding more than this share of all detections is suspect
+    static_off_court: float = 2.0    # meters outside the court a suspect cell must map to before it is dropped
 
 
 @dataclass
@@ -97,9 +100,10 @@ def call_landing(court_point, match_type):
 def load_run(output_dir):
     with open(os.path.join(output_dir, "metadata.json"), "r", encoding="utf-8") as file:
         metadata = json.load(file)
-    detections_path = metadata.get("outputs", {}).get("detections") or os.path.join(output_dir, "detections.jsonl")
+    # Prefer the file next to metadata.json: the stored path goes stale if the folder is moved.
+    detections_path = os.path.join(output_dir, "detections.jsonl")
     if not os.path.exists(detections_path):
-        detections_path = os.path.join(output_dir, "detections.jsonl")
+        detections_path = metadata.get("outputs", {}).get("detections") or detections_path
     records = []
     with open(detections_path, "r", encoding="utf-8") as file:
         for line in file:
@@ -136,6 +140,34 @@ def _hand_points(record):
             if hand:
                 points.append(np.array(hand[:2], dtype=float))
     return points
+
+
+def drop_static_spots(samples, frame_height, mapper, config):
+    """Remove detections stuck on one off-court spot, such as a light or sign the detector mistakes for the shuttle.
+
+    A shuttle resting on the floor between rallies also piles up detections in one place, but it lies on or
+    near the court, so only spots that map well outside the court are dropped.
+    """
+    if not samples:
+        return samples, []
+    cell = max(1.0, config.static_cell * frame_height)
+    counts = {}
+    for sample in samples:
+        key = (int(sample["p"][0] // cell), int(sample["p"][1] // cell))
+        counts[key] = counts.get(key, 0) + 1
+    static = set()
+    for key, count in counts.items():
+        if count <= config.static_share * len(samples):
+            continue
+        centre = [(key[0] + 0.5) * cell, (key[1] + 0.5) * cell]
+        _, margin = call_landing(mapper.image_to_court(centre), config.match_type)
+        if margin < -config.static_off_court:
+            static.add(key)
+    if not static:
+        return samples, []
+    kept = [s for s in samples if (int(s["p"][0] // cell), int(s["p"][1] // cell)) not in static]
+    spots = [[round((key[0] + 0.5) * cell, 1), round((key[1] + 0.5) * cell, 1)] for key in sorted(static)]
+    return kept, spots
 
 
 def find_rallies(samples, frame_height, config):
@@ -197,7 +229,7 @@ def compute_line_calls(metadata, records, config=None):
     mapper = CourtMapper([tuple(corner) for corner in metadata["court"]["corners"]])
     records_by_frame = {int(record["frame"]): record for record in records}
 
-    samples = _shuttle_samples(records, fps)
+    samples, _ = drop_static_spots(_shuttle_samples(records, fps), frame_height, mapper, config)
     rallies = find_rallies(samples, frame_height, config)
 
     calls = []

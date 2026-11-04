@@ -158,6 +158,20 @@ class ComputeLineCallsTests(unittest.TestCase):
         self.match.idle(2)
         self.assertEqual(self.calls(), [])
 
+    def test_fixed_false_detection_off_court_is_ignored(self):
+        # A stadium light above the court the detector keeps reporting as the shuttle.
+        light = [1100.0, 60.0]
+        for _ in range(3):
+            self.match.rally((3.0, 12.0), (3.0, 2.0), settle_seconds=0.0)
+            for _ in range(3 * FPS):
+                self.match._add(shuttle=light)
+
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        for call in calls:
+            self.assertEqual((call.call, call.landing_side), ("in", "upper"))
+            self.assertAlmostEqual(call.landing_court[1], 2.0, delta=0.3)
+
 
 if __name__ == "__main__":
     unittest.main()
