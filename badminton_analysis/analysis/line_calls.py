@@ -36,7 +36,7 @@ class LineCallConfig:
     move_speed: float = 0.25        # faster than this (per second) = shuttle in flight
     still_radius: float = 0.015     # settled shuttle stays within this radius
     max_link_gap: float = 0.25      # seconds; larger detection gaps are not used for speed
-    merge_gap: float = 0.6          # seconds; flight pieces closer than this form one rally
+    merge_gap: float = 1.0          # seconds; flight pieces closer than this form one rally
     top_exit_margin: float = 0.05   # flight last seen this close to the top edge = high shot above the frame
     offscreen_gap: float = 3.0      # seconds a high shot may stay above the frame without ending the rally
     min_rally_duration: float = 0.5
@@ -49,6 +49,10 @@ class LineCallConfig:
     static_cell: float = 0.01        # grid cell size for finding fixed false detections
     static_share: float = 0.02       # a cell holding more than this share of all detections is suspect
     static_off_court: float = 2.0    # meters outside the court a suspect cell must map to before it is dropped
+    # Between points the shuttle is tapped or thrown back to the server: short, low, and the
+    # players hardly move. A real rally covers more of the screen height and both players run.
+    min_rally_height: float = 0.35   # shuttle's vertical travel in screen heights
+    min_player_move: float = 3.0     # meters walked by the player who moved least
 
 
 @dataclass
@@ -204,6 +208,35 @@ def find_rallies(samples, frame_height, config):
     return rallies
 
 
+def _player_path(records, start_frame, end_frame, side):
+    points = [
+        record["players"][side]["court"]
+        for record in records
+        if start_frame <= record["frame"] <= end_frame
+        and (record.get("players") or {}).get(side) and record["players"][side].get("court")
+    ]
+    if len(points) < 2:
+        return None
+    return float(np.sum(np.linalg.norm(np.diff(np.array(points, dtype=float), axis=0), axis=1)))
+
+
+def is_play(samples, first, last, records, frame_height, config):
+    """Tell a rally from the shuttle being knocked about between points.
+
+    Only a candidate that stays low and leaves both players nearly still is dropped:
+    a two-shot rally (serve, then a winner) moves the players little too, but the
+    serve sends the shuttle high.
+    """
+    heights = [samples[i]["p"][1] for i in range(first, last + 1)]
+    if (max(heights) - min(heights)) / frame_height >= config.min_rally_height:
+        return True
+    paths = [_player_path(records, samples[first]["frame"], samples[last]["frame"], side)
+             for side in ("upper", "lower")]
+    paths = [path for path in paths if path is not None]
+    # With a player missing there is nothing to go on, so keep the rally.
+    return len(paths) < 2 or min(paths) >= config.min_player_move
+
+
 def _find_settle(samples, start, stop, end_t, frame_height, config):
     """Find the first run of samples where the shuttle sits still after flight."""
     radius = config.still_radius * frame_height
@@ -230,7 +263,10 @@ def compute_line_calls(metadata, records, config=None):
     records_by_frame = {int(record["frame"]): record for record in records}
 
     samples, _ = drop_static_spots(_shuttle_samples(records, fps), frame_height, mapper, config)
-    rallies = find_rallies(samples, frame_height, config)
+    rallies = [
+        (first, last) for first, last in find_rallies(samples, frame_height, config)
+        if is_play(samples, first, last, records, frame_height, config)
+    ]
 
     calls = []
     for index, (first, last) in enumerate(rallies):

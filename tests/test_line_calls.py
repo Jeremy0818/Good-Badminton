@@ -31,9 +31,11 @@ class SyntheticMatch:
     def _image(self, court_point):
         return [float(v) for v in self.mapper.court_to_image(np.array(court_point, dtype=np.float32))]
 
-    def _add(self, shuttle=None, hand=None):
+    def _add(self, shuttle=None, hand=None, courts=None):
         self.frame += 1
         players = {"upper": None, "lower": None}
+        for side, court in (courts or {}).items():
+            players[side] = {"image": None, "court": list(court), "speed": None, "hands": {}}
         if hand is not None:
             players["lower"] = {"image": hand, "court": None, "speed": None,
                                 "hands": {"left": None, "right": hand}}
@@ -157,6 +159,25 @@ class ComputeLineCallsTests(unittest.TestCase):
             self.match._add(shuttle=[float(start[0] + i * 0.5), float(start[1])])
         self.match.idle(2)
         self.assertEqual(self.calls(), [])
+
+    def test_shuttle_tapped_low_between_points_is_not_a_rally(self):
+        # Knocked back to the server along the floor; both players stand still.
+        start = np.array(self.match._image((3.0, 12.0)))
+        for i in range(30):
+            point = [float(start[0] + i * 8), float(start[1] - i * 2)]
+            self.match._add(shuttle=point, courts={"upper": (3.0, 3.0), "lower": (3.0, 11.0)})
+        self.match.idle(2)
+        self.assertEqual(self.calls(), [])
+
+    def test_short_rally_with_still_players_is_kept_when_the_shuttle_goes_high(self):
+        # A serve straight into a winner: the players barely move, but the serve goes high.
+        frames_before = len(self.match.records)
+        self.match.rally((3.0, 12.0), (3.0, 2.0))
+        for record in self.match.records[frames_before:]:
+            record["players"]["upper"] = {"image": None, "court": [3.0, 3.0], "speed": None, "hands": {}}
+            record["players"]["lower"] = {"image": None, "court": [3.0, 11.0], "speed": None, "hands": {}}
+        self.match.idle(2)
+        self.assertEqual(len(self.calls()), 1)
 
     def test_fixed_false_detection_off_court_is_ignored(self):
         # A stadium light above the court the detector keeps reporting as the shuttle.
