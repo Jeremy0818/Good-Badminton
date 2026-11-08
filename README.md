@@ -278,6 +278,27 @@ python -m badminton_analysis.analysis.line_calls outputs/<视频名> --match-typ
 
 单机位对清晰的落点判定可靠；距边线仅几厘米的球，或 25-30 fps 下羽毛球模糊的落点，仍需人工复核。
 
+### 计分与复核
+
+在转播测试比赛上，自动计分约能判对 70% 的回合胜方，因此比分通过快速复核生成：逐个回放每回合结尾并标出自动判定，按一个键确认或更正。
+
+```bash
+python -m badminton_analysis.analysis.review outputs/<视频名> --names "Lee,Tan" --player1-side lower
+```
+
+| 按键 | 作用 |
+| --- | --- |
+| Enter / 空格 | 接受自动判定的胜方 |
+| `n` / `f` | 近端 / 远端赢得该回合 |
+| `x` | 不是回合（热身、回放、把球打回给发球方） |
+| `r` / `b` | 重播片段 / 返回上一回合 |
+| `q` / Esc | 保存并退出；再次运行即可从上次位置继续 |
+
+- `--player1-side` 为球员 1 开局所在的一侧（`lower` = 靠近镜头）。每局结束后及第三局 11 分时自动换边。
+- 视频从比赛中途开始时，用 `--start-score 12-6` 和 `--start-games 1-0` 设定起始比分。
+- `--skip-high` 会直接接受高置信度的判定，不再逐个显示。
+- 每按一次键都会把决定保存到 `review.json`；比分保存在 `review_report.json`。
+
 ## 📊 输出结果
 
 默认输出到 `outputs/<视频文件名>/`：

@@ -280,6 +280,27 @@ python -m badminton_analysis.analysis.line_calls outputs/<video_name> --match-ty
 
 Single-camera calls are reliable for clear landings. Shots within a few cm of a line, or landings at 25-30 fps where the shuttle is blurred, still need a human check.
 
+### Scoring with Review
+
+Automatic scoring gets roughly 70% of rally winners right on broadcast test matches, so the score is built with a quick review: each rally's ending is replayed with the automatic call drawn on it, and one key confirms or corrects it.
+
+```bash
+python -m badminton_analysis.analysis.review outputs/<video_name> --names "Lee,Tan" --player1-side lower
+```
+
+| Key | Action |
+| --- | --- |
+| Enter / Space | Accept the automatic winner |
+| `n` / `f` | Near / far side won the rally |
+| `x` | Not a rally (warm-up, replay, shuttle knocked back) |
+| `r` / `b` | Replay the clip / go back one rally |
+| `q` / Esc | Save and quit; run again to continue where you left off |
+
+- `--player1-side` is the side player 1 starts on (`lower` = near the camera). Ends change automatically after each game and at 11 in game 3.
+- `--start-score 12-6` and `--start-games 1-0` set the score when the video starts part-way through a match.
+- `--skip-high` accepts high-confidence calls without showing them.
+- Decisions are saved to `review.json` after every key; the score is in `review_report.json`.
+
 ## 📊 Outputs
 
 Default output directory: `outputs/<video_name>/`.
