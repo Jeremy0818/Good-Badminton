@@ -267,9 +267,9 @@ RTMPose / RTMO modes:
 
 `--line-calls true` finds where the last shot of each rally landed and calls it in or out. Rallies are split from shuttle motion, so it works on fixed-camera recordings with no camera cuts.
 
-- A landing is where the shuttle first touches the floor. It often bounces or skids on 0.3 m or more before it stops, so the touch-down is worked out from the moment its fast flight ends, between video frames. A shuttle that stops next to a player's hand is treated as caught, not landed.
+- A landing is where the shuttle first touches the floor. It often bounces or skids on 0.3 m or more before it stops, so the touch-down is worked out from the moment its fast flight ends, between video frames. A shuttle that slides on fast is placed where its speed across the court drops from flight speed to sliding speed. A shuttle that stops next to a player's hand is treated as caught, not landed.
 - A shuttle on the line is in. Each call reports its distance to the nearest boundary line in cm.
-- Calls are flagged for review when the shuttle was lost before it settled, was caught, landed within 15 cm of a line, or landed within 30 cm of the net.
+- Calls are flagged for review when the shuttle was lost before it settled, was caught, landed within 15 cm of a line or 30 cm of the net, or seemed to land more than 3 m outside the court (no shot lands that far out, so it was still in the air).
 - Outputs: `line_calls.json`, `line_calls_map.png` (landing points on a court diagram), and `line_calls_<video_name>.mp4` (landing point and call drawn on the video).
 
 Re-run line calls on an existing output directory without re-processing the video:
@@ -286,7 +286,7 @@ For more accurate landings, track the shuttle a second time with [TrackNetV3](ht
 python -m badminton_analysis.detection.tracknet outputs/<video_name>
 ```
 
-It saves `tracknet.csv` next to `detections.jsonl`, and line calls, scoring and both reviews use its shuttle positions from then on (delete the file to go back to the detector's). On an Apple M3 Pro it takes about 22 ms per analysed frame of 1080p video, faster than the video plays. On four broadcast test matches it raised correct line calls from 105 of 142 to 118 of 146 and cut the median distance from the labelled landing spot from 42 to 27 cm.
+It saves `tracknet.csv` next to `detections.jsonl`, and line calls, scoring and both reviews use its shuttle positions from then on (delete the file to go back to the detector's). On an Apple M3 Pro it takes about 22 ms per analysed frame of 1080p video, faster than the video plays. On four broadcast test matches it raised correct line calls from 106 of 142 to 121 of 146 and cut the median distance from the labelled landing spot from 30 to 22 cm.
 
 ### Scoring with Review
 

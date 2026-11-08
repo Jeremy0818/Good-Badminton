@@ -52,6 +52,13 @@ class LineCallConfig:
     # one sigma. Retune it on recordings from your own camera.
     position_error: float = 0.02
     bounce_error: float = 0.3       # meters a shuttle seen only after it bounced may have moved
+    # A shuttle that comes down fast often slides or bounces on for a meter or more, too fast to count as
+    # resting. Once it is on the floor its place on the court map is real, so it moves a few meters per
+    # second there at most, while a shuttle still dropping through the air sweeps across the map.
+    slide_window: float = 0.7       # seconds before the shuttle comes to rest to look for the touch-down
+    slide_max_speed: float = 12.0   # m/s on the court map; faster is still in the air
+    slide_drop: float = 3.0         # the flight must cross the court map this many times faster than the slide
+    max_out: float = 3.0            # meters outside the court; a "landing" further out was still in the air
     hand_radius: float = 0.06       # settled shuttle this close to a hand = held, not landed
     close_call_margin: float = 0.15  # meters from a line that counts as a close call
     net_margin: float = 0.3          # meters from the net where the landing side is uncertain
@@ -131,7 +138,7 @@ def load_run(output_dir, use_tracknet=True):
             if line:
                 records.append(json.loads(line))
     # TrackNet's shuttle replaces the detector's in every frame. It follows the shuttle down to the floor
-    # more often: on four ShuttleSet matches it got 118 of 146 line calls right against 105 of 142, and
+    # more often: on four ShuttleSet matches it got 121 of 146 line calls right against 106 of 142, and
     # filling its gaps with the detector's positions made the calls worse.
     tracknet_path = os.path.join(output_dir, TRACKNET_CSV)
     if use_tracknet and os.path.exists(tracknet_path):
@@ -287,18 +294,91 @@ def _velocity(samples, a, b):
     return (samples[b]["p"] - samples[a]["p"]) / (samples[b]["t"] - samples[a]["t"])
 
 
-def _find_touchdown(samples, first, last, stop, settle, fps, config):
-    """Where and when the shuttle first touched the floor: (image point, frame, detect frame).
+def _fit_velocity(samples, indices):
+    """Least-squares image velocity (px/s) through the samples, with their mean time and position."""
+    t = np.array([samples[i]["t"] for i in indices])
+    p = np.array([samples[i]["p"] for i in indices])
+    t_mean, p_mean = t.mean(), p.mean(axis=0)
+    velocity = ((t - t_mean)[:, None] * (p - p_mean)).sum(axis=0) / max(float(((t - t_mean) ** 2).sum()), 1e-9)
+    return velocity, t_mean, p_mean
+
+
+def _run(samples, start, stop, config, count=3):
+    """Indices of up to count linked samples from start on."""
+    indices = [start]
+    while len(indices) < count and indices[-1] + 1 < stop and _linked(samples, indices[-1], indices[-1] + 1, config):
+        indices.append(indices[-1] + 1)
+    return indices
+
+
+def _find_slide(samples, first, stop, settle, fps, frame_height, mapper, config):
+    """Where a shuttle that slid or bounced on after landing touched down, as _find_touchdown
+    returns it, or None if it did not slide.
+
+    Looks back from where it came to rest for the sample k where it hit the floor: its image
+    motion carries on the same way after k, and on the court map it slows from flight speed to
+    sliding speed. Decelerating in the air is smooth and keeps it fast on the map, and a hit sends
+    it back. Of several such samples, take the one where it slowed down most in the image.
+    """
+    move_px = config.move_speed * frame_height
+    rest, rest_end = settle[0], settle[-1]
+    court = {}
+
+    def map_speed(a, b):
+        for i in (a, b):
+            if i not in court:
+                court[i] = np.array(mapper.image_to_court([float(samples[i]["p"][0]), float(samples[i]["p"][1])])[:2])
+        return float(np.linalg.norm(court[b] - court[a])) / (samples[b]["t"] - samples[a]["t"])
+
+    best = None
+    for k in range(rest_end - 1, first + 1, -1):
+        if samples[rest]["t"] - samples[k]["t"] > config.slide_window:
+            break
+        if not all(_linked(samples, i, i + 1, config) for i in range(k - 2, rest_end)):
+            continue
+        incoming = _fit_velocity(samples, [k - 2, k - 1, k])
+        speed_in = float(np.linalg.norm(incoming[0]))
+        if not move_px <= speed_in <= 5 * frame_height:   # faster is a jump to a false detection
+            continue
+        runs = [_run(samples, j, stop, config) for j in range(k + 1, rest_end + 1)]
+        outgoing = [_fit_velocity(samples, run) for run in runs if len(run) >= 2]
+        if not outgoing or any(float(incoming[0] @ v) < 0 for v, _, _ in outgoing if np.linalg.norm(v) > 0.5 * move_px):
+            continue
+        slide_speed = max((map_speed(j, j + 2) for j in range(k + 1, rest_end - 1)), default=0.0)
+        if slide_speed > config.slide_max_speed or map_speed(k - 2, k) < config.slide_drop * slide_speed:
+            continue
+        slowdown = speed_in - max(float(np.linalg.norm(v)) for v, _, _ in outgoing)
+        if best is None or slowdown > best[0]:
+            best = (slowdown, k, incoming, outgoing[0])
+    if best is None:
+        return None
+    _, k, (v_in, t_in, p_in), (v_out, t_out, p_out) = best
+    # The touch-down is where the lines of motion before and after k come closest, between k and the next sample.
+    change = v_in - v_out
+    apart = p_in - v_in * t_in - p_out + v_out * t_out
+    t = float(np.clip(-(apart @ change) / max(float(change @ change), 1e-9), samples[k]["t"], samples[k + 1]["t"]))
+    point = (p_in + v_in * (t - t_in) + p_out + v_out * (t - t_out)) / 2
+    offset = int(round((t - samples[k]["t"]) * fps))
+    return point, samples[k]["frame"] + offset, samples[k]["detect_frame"] + offset, v_in
+
+
+def _find_touchdown(samples, first, last, stop, settle, fps, frame_height, mapper, config):
+    """Where and when the shuttle first touched the floor: (image point, frame, detect frame,
+    incoming image velocity in px/s, or None when the point is the first still sample).
 
     A shuttle often bounces or skids on for 0.3 m or more after touching down, so where it
-    comes to rest is too deep. The touch-down lies between the last fast sample and the next
-    one: find the moment when the incoming flight, continued at its last speed, meets the
-    slow motion that follows. Without samples on both sides, use the first still sample.
-    The last value is the incoming image velocity (px/s), or None for the first still sample.
+    comes to rest is too deep. If it slid on fast enough to look like flight, find where the
+    slide began. Otherwise the touch-down lies between the last fast sample and the next one:
+    find the moment when the incoming flight, continued at its last speed, meets the slow
+    motion that follows. Without samples on both sides, or if the shuttle was lost on its way
+    down, use the first still sample.
     """
+    slide = _find_slide(samples, first, stop, settle, fps, frame_height, mapper, config)
+    if slide:
+        return slide
     after = last + 1
     if not (first < last and after < stop and _linked(samples, last - 1, last, config)
-            and _linked(samples, last, after, config)):
+            and all(_linked(samples, i, i + 1, config) for i in range(last, max(after, settle[0])))):
         sample = samples[settle[0]]
         return sample["p"], sample["frame"], sample["detect_frame"], None
     v_in = _velocity(samples, last - 1, last)
@@ -365,7 +445,7 @@ def compute_line_calls(metadata, records, config=None):
         settle = _find_settle(samples, last, next_start, samples[last]["t"], frame_height, config)
         if settle:
             point, landing_frame, landing_detect_frame, velocity = _find_touchdown(
-                samples, first, last, next_start, settle, fps, config)
+                samples, first, last, next_start, settle, fps, frame_height, mapper, config)
             rally.landing_method = "settled"
             hand_px = config.hand_radius * frame_height
             for k in settle:
@@ -386,16 +466,22 @@ def compute_line_calls(metadata, records, config=None):
         rally.landing_image = [round(float(point[0]), 1), round(float(point[1]), 1)]
         rally.landing_court = [float(court_point[0]), float(court_point[1])]
         rally.landing_side = "upper" if court_point[1] < NET_Y else "lower"
-        if rally.landing_method != "last_seen":  # a lost shuttle's position is a guess, not a measurement
-            rally.landing_error_m = landing_error(mapper.matrix, point, velocity, fps, frame_height, config)
         rally.call, rally.margin_m = call_landing(court_point, config.match_type)
+        # No shot lands that far out. The point is the shuttle high in the air, which the court
+        # mapping puts on the floor far behind it.
+        in_air = rally.margin_m < -config.max_out
+        if in_air:
+            rally.flags.append(f"landing {-rally.margin_m:.1f} m outside the court: "
+                               "the shuttle was probably still in the air")
+        elif rally.landing_method != "last_seen":  # a lost shuttle's position is a guess, not a measurement
+            rally.landing_error_m = landing_error(mapper.matrix, point, velocity, fps, frame_height, config)
 
         if abs(rally.margin_m) < config.close_call_margin:
             rally.flags.append(f"close call: {abs(rally.margin_m) * 100:.0f} cm from the line")
         net_distance = abs(rally.landing_court[1] - NET_Y)
         if net_distance < config.net_margin:
             rally.flags.append(f"landed {net_distance * 100:.0f} cm from the net: which side it fell on is uncertain")
-        if rally.landing_method == "settled":
+        if rally.landing_method == "settled" and not in_air:
             rally.confidence = "medium" if abs(rally.margin_m) < config.close_call_margin else "high"
         calls.append(rally)
 

@@ -56,25 +56,30 @@ class SyntheticMatch:
         for _ in range(int(seconds * FPS)):
             self._add()
 
-    def rally(self, start_court, landing_court, flight_seconds=1.0, settle_seconds=1.0, held=False, skid_to=None):
+    def rally(self, start_court, landing_court, flight_seconds=1.0, settle_seconds=1.0, held=False, skid_to=None,
+              skid_frames=9, lost_from=None):
         start = np.array(self._image(start_court))
         end = np.array(self._image(landing_court))
         steps = int(flight_seconds * FPS)
         for i in range(steps + 1):
             u = i / steps
+            if lost_from is not None and u > lost_from:  # lost on the way down: one repeated frame, then nothing
+                self._add(shuttle=self.records[-1]["shuttlecock"]["image"] if (i - 1) / steps <= lost_from else None)
+                continue
             point = start + (end - start) * u
             point[1] -= 220 * 4 * u * (1 - u)  # arc: the shuttle rises in the image mid-flight
             self._add(shuttle=[float(point[0]), float(point[1])])
-        if skid_to is not None:  # slides on slowly after touching down, then rests there
+        if skid_to is not None:  # slides on after touching down, then rests there
             rest = np.array(self._image(skid_to))
-            for i in range(1, 10):
-                point = end + (rest - end) * i / 9
+            for i in range(1, skid_frames + 1):
+                point = end + (rest - end) * i / skid_frames
                 self._add(shuttle=[float(point[0]), float(point[1])])
             end = rest
         hand = [float(end[0]) + 5, float(end[1]) - 5] if held else None
         for i in range(int(settle_seconds * FPS)):
             jitter = 1.0 if i % 2 else -1.0
-            self._add(shuttle=[float(end[0]) + jitter, float(end[1])], hand=hand)
+            found = lost_from is None or i >= 10   # a lost shuttle is found again a little after it came to rest
+            self._add(shuttle=[float(end[0]) + jitter, float(end[1])] if found else None, hand=hand)
 
 
 class CallLandingTests(unittest.TestCase):
@@ -145,6 +150,30 @@ class ComputeLineCallsTests(unittest.TestCase):
         call = self.calls()[0]
         self.assertEqual((call.landing_method, call.call), ("settled", "in"))
         self.assertAlmostEqual(call.landing_court[1], 0.15, delta=0.08)
+
+    def test_a_fast_slide_after_touching_down_is_not_taken_for_flight(self):
+        # Lands 0.8 m inside the near baseline and slides 1.8 m in 0.2 s, fast enough to count as moving.
+        self.match.rally((3.0, 2.0), (3.0, 12.6), skid_to=(3.0, 14.4), skid_frames=6)
+        self.match.idle(2)
+        call = self.calls()[0]
+        self.assertEqual((call.landing_method, call.call), ("settled", "in"))
+        self.assertAlmostEqual(call.landing_court[1], 12.6, delta=0.3)
+
+    def test_shuttle_lost_on_its_way_down_lands_where_it_comes_to_rest(self):
+        self.match.rally((3.0, 2.0), (3.0, 13.8), lost_from=0.8)   # out by 0.4 m, last seen high in the air
+        self.match.idle(2)
+        call = self.calls()[0]
+        self.assertEqual((call.landing_method, call.call), ("settled", "out"))
+        self.assertAlmostEqual(call.landing_court[1], 13.8, delta=0.05)
+
+    def test_a_landing_far_outside_the_court_is_not_trusted(self):
+        self.match.rally((3.0, 12.0), (3.0, -4.0))   # no shot lands 4 m long: the shuttle was in the air
+        self.match.idle(2)
+        # Keep the still shuttle, which would otherwise be dropped as a fixed object off the court.
+        call = compute_line_calls(METADATA, self.match.records, LineCallConfig(static_share=1.0))[0]
+        self.assertEqual((call.landing_method, call.call, call.confidence), ("settled", "out", "low"))
+        self.assertIsNone(call.landing_error_m)
+        self.assertTrue(any("still in the air" in flag for flag in call.flags))
 
     def test_landing_error_is_larger_far_from_the_camera_and_absent_when_lost(self):
         self.match.rally((3.0, 12.0), (3.0, 1.0))   # far court: fewer pixels per meter
