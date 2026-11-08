@@ -4,13 +4,15 @@ Frames are handled as they arrive. Frames that do not show the court are skipped
 replays and close-ups), TrackNet finds the shuttle 4 to 7 frames after a frame arrives, and the
 players' poses are taken a few times a second rather than on every frame. Each court frame gives one
 record in the format of the main pipeline's detections.jsonl, so line calls and the review can read it.
+Each rally's line call is made from the records as soon as it is final, about 2.5 s after the landing.
 
 Try it on an analysed video, replayed at its own speed as if it were being filmed now:
 
     python -m badminton_analysis.live.tracker outputs/<video_name> --start 600 --seconds 120
 
-It writes live_detections.jsonl next to detections.jsonl and reports how long each step takes per
-frame and how long after its frame each record was ready.
+It writes live_detections.jsonl and live_line_calls.json next to detections.jsonl, prints each call as
+it is made, and reports how long each step takes per frame and how long after its frame each record
+was ready.
 """
 
 import argparse
@@ -18,16 +20,19 @@ import collections
 import json
 import os
 import time
+from dataclasses import asdict
 
 import cv2
 import numpy as np
 
+from ..analysis.line_calls import LiveLineCaller
 from ..court.mapper import CourtMapper
 from ..data.writer import JsonlDetectionWriter
 from ..detection.tracknet import DEFAULT_WEIGHTS, TrackNetRun, TrackNetTracker, pick_device
 from ..tracking.player import PlayerTracker
 
 LIVE_DETECTIONS = "live_detections.jsonl"
+LIVE_CALLS = "live_line_calls.json"
 COURT_MATCH = 0.75   # template match score of a frame that shows the court, as in the main pipeline
 # The court check compares frames shrunk to a quarter of their size: on 3600 broadcast frames it picked the
 # same court frames as the main pipeline's full-size check, in 1.6 ms a frame instead of 30.
@@ -75,6 +80,7 @@ class LiveTracker:
         self.run = None                        # TrackNet run of the current stretch of court frames
         self.waiting = collections.deque()     # records whose shuttle TrackNet has not given yet
         self.finished = []
+        self.frame = 0
         self.court_frames = 0
         self.record = None
         self.times = collections.defaultdict(float)   # seconds spent in each step
@@ -85,6 +91,7 @@ class LiveTracker:
 
     def add_frame(self, frame, image):
         """Process frame number `frame`, counted from 1. Returns the records finished so far, in order."""
+        self.frame = frame
         started = time.perf_counter()
         shows_court = self.template is None or self._shows_court(image)
         self._time("court check", started)
@@ -116,6 +123,12 @@ class LiveTracker:
         """Records left at the end of the video."""
         self._end_run()
         return self._take()
+
+    @property
+    def done_through(self):
+        """The frame up to which every record has been handed out: frames that do not show the court
+        give none."""
+        return self.waiting[0]["frame"] - 1 if self.waiting else self.frame
 
     def _shows_court(self, image):
         gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), self.court_size, interpolation=cv2.INTER_AREA)
@@ -205,25 +218,47 @@ def main():
         processor = YOLOPoseProcessor(model_path=args.pose_model, device=pick_device())
         pose = PlayerPoseVisualizer(processor, show_skeletons=False, show_player_trajectories=False)
     live = LiveTracker(metadata, TrackNetTracker(args.weights), pose, pose_every=args.pose_every or 1.0)
+    caller = LiveLineCaller(metadata)
     first = int(args.start * fps) + 1
     last = first + int(args.seconds * fps) - 1
-    delays = []
+    delays, calls = [], []
+    first_due = None
+
+    def report(new_calls):
+        for call in new_calls:
+            # How long after the landing frame was filmed the call was made; replaying as fast as possible
+            # has no filming time.
+            after = time.perf_counter() - first_due - (call.landing_frame - first) / (fps * args.speed) \
+                if args.speed else None
+            margin = abs(call.margin_m)
+            distance = f"{margin * 100:.0f} cm" if margin < 1 else f"{margin:.2f} m"
+            print(f"rally {call.rally}: {call.call.upper()} by {distance}, landed at frame {call.landing_frame}"
+                  + (f", called {after:.1f} s later" if after is not None else ""), flush=True)
+            calls.append(dict(asdict(call), called_after_s=after))
+
     with JsonlDetectionWriter(os.path.join(args.output_dir, LIVE_DETECTIONS)) as writer:
         due_at = {}
         started = None
         for frame, image, due in replay(args.video or metadata["video"]["path"], first, last, fps, args.speed,
                                         live.times):
             started = started or time.perf_counter()
+            first_due = first_due or due
             due_at[frame] = due
-            for record in live.add_frame(frame, image):
+            records = live.add_frame(frame, image)
+            for record in records:
                 writer.write(record)
                 delays.append(time.perf_counter() - due_at.pop(record["frame"]))
             for old in [f for f in due_at if f < frame - 2 * fps]:   # frames that gave no record
                 del due_at[old]
-        for record in live.finish():
+            report(caller.update(records, live.done_through / fps))
+        records = live.finish()
+        for record in records:
             writer.write(record)
             delays.append(time.perf_counter() - due_at.pop(record["frame"], time.perf_counter()))
+        report(caller.update(records, live.done_through / fps) + caller.finish())
         elapsed = time.perf_counter() - (started or time.perf_counter())
+    with open(os.path.join(args.output_dir, LIVE_CALLS), "w", encoding="utf-8") as file:
+        json.dump(calls, file, indent=1)
 
     frames = last - first + 1
     steps = ", ".join(f"{step} {seconds / frames * 1000:.1f}" for step, seconds in live.times.items())

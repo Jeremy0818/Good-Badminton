@@ -336,15 +336,17 @@ python -m badminton_analysis.live.capture
 
 Placement: beside the court in line with the net, as high as possible, with the whole court in the picture (usually the 0.5× camera, if the phone's browser offers it). From there every hit reverses the shuttle's direction across the picture, which makes hits and hitters easy to find. High behind a baseline also works.
 
-### Tracking While Filming (Experimental)
+### Tracking and Calling While Filming (Experimental)
 
-The first part of live review tracks the shuttle and players as frames arrive, with TrackNet for the shuttle and a pose a few times a second. Until it is joined to the phone, try it by replaying an analysed video at its own speed:
+The first part of live review tracks the shuttle and players as frames arrive, with TrackNet for the shuttle and a pose a few times a second, and makes each rally's line call as soon as nothing still to come can change it. Until it is joined to the phone, try it by replaying an analysed video at its own speed:
 
 ```bash
 python -m badminton_analysis.live.tracker outputs/<video_name> --start 600 --seconds 120
 ```
 
-It writes `live_detections.jsonl` next to `detections.jsonl` and reports the time each step takes. On an Apple M3 Pro, two minutes of a broadcast match took 15 ms a frame of the 33 ms available at 30 fps, and each frame's record was ready 0.3 s after the frame. Its line calls were the same as those from the full analysis.
+It prints each call as it is made, writes `live_detections.jsonl` and `live_line_calls.json` next to `detections.jsonl`, and reports the time each step takes. On an Apple M3 Pro, two minutes of a broadcast match took 15 ms a frame of the 33 ms available at 30 fps, and each frame's record was ready 0.3 s after the frame.
+
+A call waits until the shuttle has been followed for 2.5 s after its last flight, so it comes about 3 s after the landing. On four ShuttleSet matches the live calls were the same as those of the full analysis for all 280 rallies. Two came more than 4 s after the landing: in both the shuttle was lost, and it was flying again straight after.
 
 ## 📊 Outputs
 

@@ -47,6 +47,10 @@ class LineCallConfig:
     min_rally_points: int = 6
     settle_window: float = 1.5      # seconds after the last flight sample to look for the landing
     settle_points: int = 3
+    # The shuttle at rest is followed until this many seconds after the last flight sample, not until someone
+    # picks it up, so the call can be made while the match goes on. On four ShuttleSet matches this moved one
+    # landing, by 2 cm.
+    rest_window: float = 2.0
     # Error of a landing point, shown as a ring in the review. position_error (screen heights) covers
     # detection, timing and bounce together: at 0.02, 70% of ShuttleSet's labelled landings fall within
     # one sigma. Retune it on recordings from your own camera.
@@ -188,25 +192,42 @@ def drop_static_spots(samples, frame_height, mapper, config):
     cell = max(1.0, config.static_cell * frame_height)
     counts = {}
     for sample in samples:
-        key = (int(sample["p"][0] // cell), int(sample["p"][1] // cell))
+        key = _cell(sample, cell)
         counts[key] = counts.get(key, 0) + 1
+    static = static_cells(counts, len(samples), cell, mapper, config)
+    if not static:
+        return samples, []
+    kept = [s for s in samples if _cell(s, cell) not in static]
+    spots = [[round((key[0] + 0.5) * cell, 1), round((key[1] + 0.5) * cell, 1)] for key in sorted(static)]
+    return kept, spots
+
+
+def _cell(sample, cell):
+    return int(sample["p"][0] // cell), int(sample["p"][1] // cell)
+
+
+def static_cells(counts, total, cell, mapper, config):
+    """Cells holding more than static_share of `total` detections that lie well outside the court."""
     static = set()
     for key, count in counts.items():
-        if count <= config.static_share * len(samples):
+        if count <= config.static_share * total:
             continue
         centre = [(key[0] + 0.5) * cell, (key[1] + 0.5) * cell]
         _, margin = call_landing(mapper.image_to_court(centre), config.match_type)
         if margin < -config.static_off_court:
             static.add(key)
-    if not static:
-        return samples, []
-    kept = [s for s in samples if (int(s["p"][0] // cell), int(s["p"][1] // cell)) not in static]
-    spots = [[round((key[0] + 0.5) * cell, 1), round((key[1] + 0.5) * cell, 1)] for key in sorted(static)]
-    return kept, spots
+    return static
 
 
-def find_rallies(samples, frame_height, config):
-    """Group shuttle samples into rallies. Returns (first_index, last_index) of flight samples."""
+def rally_gap(sample, frame_height, config):
+    """How long the flight may pause after this sample and still be the same rally. A clear or lob often
+    leaves the top of the frame; that is not the end of the rally."""
+    return config.offscreen_gap if sample["p"][1] < config.top_exit_margin * frame_height else config.merge_gap
+
+
+def flight_groups(samples, frame_height, config):
+    """Indices of the samples where the shuttle flies, grouped into stretches without a pause longer than
+    rally_gap."""
     move_px = config.move_speed * frame_height
     moving = []
     for i in range(1, len(samples)):
@@ -217,20 +238,20 @@ def find_rallies(samples, frame_height, config):
         if speed > move_px:
             moving.append(i)
 
-    top_exit_px = config.top_exit_margin * frame_height
     groups = []
     for i in moving:
-        if groups:
-            last_seen = samples[groups[-1][-1]]
-            # A clear or lob often leaves the top of the frame; that is not the end of the rally.
-            allowed_gap = config.offscreen_gap if last_seen["p"][1] < top_exit_px else config.merge_gap
-        if groups and samples[i]["t"] - last_seen["t"] <= allowed_gap:
+        if groups and samples[i]["t"] - samples[groups[-1][-1]]["t"] <= rally_gap(samples[groups[-1][-1]],
+                                                                                    frame_height, config):
             groups[-1].append(i)
         else:
             groups.append([i])
+    return groups
 
+
+def find_rallies(samples, frame_height, config):
+    """Group shuttle samples into rallies. Returns (first_index, last_index) of flight samples."""
     rallies = []
-    for group in groups:
+    for group in flight_groups(samples, frame_height, config):
         first = max(0, group[0] - 1)
         last = group[-1]
         duration = samples[last]["t"] - samples[first]["t"]
@@ -276,6 +297,8 @@ def _find_settle(samples, start, stop, end_t, frame_height, config):
             break
         run = [j]
         for k in range(j + 1, stop):
+            if samples[k]["t"] - end_t > config.rest_window:
+                break
             if samples[k]["t"] - samples[run[-1]]["t"] > config.max_link_gap:
                 break
             if np.linalg.norm(samples[k]["p"] - samples[j]["p"]) > radius:
@@ -434,58 +457,155 @@ def compute_line_calls(metadata, records, config=None):
     calls = []
     for index, (first, last) in enumerate(rallies):
         next_start = rallies[index + 1][0] if index + 1 < len(rallies) else len(samples)
-        rally = RallyCall(
-            rally=index + 1,
-            start_frame=samples[first]["frame"],
-            end_frame=samples[last]["frame"],
-            start_sec=round(samples[first]["t"], 3),
-            end_sec=round(samples[last]["t"], 3),
-        )
-
-        settle = _find_settle(samples, last, next_start, samples[last]["t"], frame_height, config)
-        if settle:
-            point, landing_frame, landing_detect_frame, velocity = _find_touchdown(
-                samples, first, last, next_start, settle, fps, frame_height, mapper, config)
-            rally.landing_method = "settled"
-            hand_px = config.hand_radius * frame_height
-            for k in settle:
-                hands = _hand_points(records_by_frame.get(samples[k]["frame"], {}))
-                if any(np.linalg.norm(samples[k]["p"] - hand) < hand_px for hand in hands):
-                    rally.landing_method = "held"
-                    rally.flags.append("shuttle still near a player's hand: caught or picked up, not a floor landing")
-                    break
-        else:
-            point = samples[last]["p"]
-            landing_frame, landing_detect_frame = samples[last]["frame"], samples[last]["detect_frame"]
-            rally.landing_method = "last_seen"
-            rally.flags.append("shuttle lost before it settled: landing taken from last flight position")
-
-        court_point = mapper.image_to_court([float(point[0]), float(point[1])])
-        rally.landing_frame = landing_frame
-        rally.landing_detect_frame = landing_detect_frame
-        rally.landing_image = [round(float(point[0]), 1), round(float(point[1]), 1)]
-        rally.landing_court = [float(court_point[0]), float(court_point[1])]
-        rally.landing_side = "upper" if court_point[1] < NET_Y else "lower"
-        rally.call, rally.margin_m = call_landing(court_point, config.match_type)
-        # No shot lands that far out. The point is the shuttle high in the air, which the court
-        # mapping puts on the floor far behind it.
-        in_air = rally.margin_m < -config.max_out
-        if in_air:
-            rally.flags.append(f"landing {-rally.margin_m:.1f} m outside the court: "
-                               "the shuttle was probably still in the air")
-        elif rally.landing_method != "last_seen":  # a lost shuttle's position is a guess, not a measurement
-            rally.landing_error_m = landing_error(mapper.matrix, point, velocity, fps, frame_height, config)
-
-        if abs(rally.margin_m) < config.close_call_margin:
-            rally.flags.append(f"close call: {abs(rally.margin_m) * 100:.0f} cm from the line")
-        net_distance = abs(rally.landing_court[1] - NET_Y)
-        if net_distance < config.net_margin:
-            rally.flags.append(f"landed {net_distance * 100:.0f} cm from the net: which side it fell on is uncertain")
-        if rally.landing_method == "settled" and not in_air:
-            rally.confidence = "medium" if abs(rally.margin_m) < config.close_call_margin else "high"
-        calls.append(rally)
-
+        calls.append(call_rally(index + 1, samples, first, last, next_start, records_by_frame, fps, frame_height,
+                                mapper, config))
     return calls
+
+
+def call_rally(number, samples, first, last, stop, records_by_frame, fps, frame_height, mapper, config):
+    """The call for the rally whose flight runs from samples[first] to samples[last]. The next rally's
+    samples start at stop."""
+    rally = RallyCall(
+        rally=number,
+        start_frame=samples[first]["frame"],
+        end_frame=samples[last]["frame"],
+        start_sec=round(samples[first]["t"], 3),
+        end_sec=round(samples[last]["t"], 3),
+    )
+
+    settle = _find_settle(samples, last, stop, samples[last]["t"], frame_height, config)
+    if settle:
+        point, landing_frame, landing_detect_frame, velocity = _find_touchdown(
+            samples, first, last, stop, settle, fps, frame_height, mapper, config)
+        rally.landing_method = "settled"
+        hand_px = config.hand_radius * frame_height
+        for k in settle:
+            hands = _hand_points(records_by_frame.get(samples[k]["frame"], {}))
+            if any(np.linalg.norm(samples[k]["p"] - hand) < hand_px for hand in hands):
+                rally.landing_method = "held"
+                rally.flags.append("shuttle still near a player's hand: caught or picked up, not a floor landing")
+                break
+    else:
+        point = samples[last]["p"]
+        landing_frame, landing_detect_frame = samples[last]["frame"], samples[last]["detect_frame"]
+        rally.landing_method = "last_seen"
+        rally.flags.append("shuttle lost before it settled: landing taken from last flight position")
+
+    court_point = mapper.image_to_court([float(point[0]), float(point[1])])
+    rally.landing_frame = landing_frame
+    rally.landing_detect_frame = landing_detect_frame
+    rally.landing_image = [round(float(point[0]), 1), round(float(point[1]), 1)]
+    rally.landing_court = [float(court_point[0]), float(court_point[1])]
+    rally.landing_side = "upper" if court_point[1] < NET_Y else "lower"
+    rally.call, rally.margin_m = call_landing(court_point, config.match_type)
+    # No shot lands that far out. The point is the shuttle high in the air, which the court
+    # mapping puts on the floor far behind it.
+    in_air = rally.margin_m < -config.max_out
+    if in_air:
+        rally.flags.append(f"landing {-rally.margin_m:.1f} m outside the court: "
+                           "the shuttle was probably still in the air")
+    elif rally.landing_method != "last_seen":  # a lost shuttle's position is a guess, not a measurement
+        rally.landing_error_m = landing_error(mapper.matrix, point, velocity, fps, frame_height, config)
+
+    if abs(rally.margin_m) < config.close_call_margin:
+        rally.flags.append(f"close call: {abs(rally.margin_m) * 100:.0f} cm from the line")
+    net_distance = abs(rally.landing_court[1] - NET_Y)
+    if net_distance < config.net_margin:
+        rally.flags.append(f"landed {net_distance * 100:.0f} cm from the net: which side it fell on is uncertain")
+    if rally.landing_method == "settled" and not in_air:
+        rally.confidence = "medium" if abs(rally.margin_m) < config.close_call_margin else "high"
+    return rally
+
+
+class LiveLineCaller:
+    """compute_line_calls for records that arrive while the match is played: each rally is called as soon
+    as nothing that comes later can change its call.
+
+    A call depends on the shuttle from the start of the rally until it has rested for rest_window, plus
+    the two samples after that which _find_slide may fit, so it is final rest_window + 2 * max_link_gap
+    after the last flight sample. By then the rally must also be over, which takes merge_gap, or
+    offscreen_gap after a shot that left the top of the frame. Flight that started since and goes on may
+    still turn out to be the next rally, which would end the search for where this one came to rest, so
+    the call must then come out the same either way. Records before the end of the last called rally are
+    let go.
+
+    Detections stuck on one off-court spot are dropped as in compute_line_calls, judged from the counts of
+    all detections so far, taken as at least min_total: otherwise, early in a match, a shuttle resting
+    outside the court would look stuck before its own rally had been called.
+    """
+
+    def __init__(self, metadata, config=None, check_every=0.2, min_total=10000):
+        self.config = config or LineCallConfig()
+        self.fps = float(metadata["video"]["fps"])
+        self.frame_height = float(metadata["video"]["height"])
+        self.mapper = CourtMapper([tuple(corner) for corner in metadata["court"]["corners"]])
+        self.cell = max(1.0, self.config.static_cell * self.frame_height)
+        self.counts, self.heavy, self.total, self.min_total = {}, set(), 0, min_total
+        self.check_every = check_every
+        self.next_check = -np.inf
+        self.records = []
+        self.called = 0
+
+    def update(self, records, now):
+        """Take the records finished since the last update. now is the time (seconds, as in time_sec) up to
+        which every record has been given. Returns the calls that are now final, in order."""
+        for record in records:
+            self.records.append(record)
+            point = (record.get("shuttlecock") or {}).get("image")
+            if point:
+                key = _cell({"p": point}, self.cell)
+                self.counts[key] = self.counts.get(key, 0) + 1
+                self.total += 1
+                if self.counts[key] > self.config.static_share * self.min_total:
+                    self.heavy.add(key)
+        if now < self.next_check:
+            return []
+        self.next_check = now + self.check_every
+        return self._final_calls(now)
+
+    def finish(self):
+        """The calls left at the end of the match."""
+        return self._final_calls(np.inf)
+
+    def _final_calls(self, now):
+        config, height = self.config, self.frame_height
+        static = static_cells({key: self.counts[key] for key in self.heavy}, max(self.total, self.min_total),
+                              self.cell, self.mapper, config)
+        samples = [s for s in _shuttle_samples(self.records, self.fps) if _cell(s, self.cell) not in static]
+        groups = flight_groups(samples, height, config)
+        rallies = [(first, last) for first, last in find_rallies(samples, height, config)
+                   if is_play(samples, first, last, self.records, height, config)]
+
+        def ended(group):
+            return now - samples[group[-1]]["t"] > rally_gap(samples[group[-1]], height, config)
+
+        records_by_frame = {int(record["frame"]): record for record in self.records}
+        rest_end = config.rest_window + 2 * config.max_link_gap
+        calls = []
+        for index, (first, last) in enumerate(rallies):
+            end_t = samples[last]["t"]
+            if now - end_t <= max(rest_end, rally_gap(samples[last], height, config)):
+                break
+            stop = rallies[index + 1][0] if index + 1 < len(rallies) else len(samples)
+            call = call_rally(self.called + 1, samples, first, last, stop, records_by_frame, self.fps, height,
+                              self.mapper, config)
+            flying = groups[-1] if groups and groups[-1][0] > last and not ended(groups[-1]) else None
+            if flying and stop in (flying[0] - 1, len(samples)):
+                other = len(samples) if stop == flying[0] - 1 else flying[0] - 1
+                if asdict(call) != asdict(call_rally(self.called + 1, samples, first, last, other, records_by_frame,
+                                                     self.fps, height, self.mapper, config)):
+                    break
+            self.called += 1
+            calls.append(call)
+
+        if len(calls) < len(rallies):
+            keep = samples[rallies[len(calls)][0]]["frame"]
+        elif groups and not ended(groups[-1]):
+            keep = samples[max(0, groups[-1][0] - 1)]["frame"]
+        else:   # a rally that starts later begins at most max_link_gap before its first flight sample
+            keep = (now - 1.0) * self.fps if np.isfinite(now) else np.inf
+        self.records = [record for record in self.records if record["frame"] >= keep]
+        return calls
 
 
 def summarize(calls):

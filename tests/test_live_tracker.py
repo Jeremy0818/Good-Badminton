@@ -51,8 +51,10 @@ class LiveTrackerTests(unittest.TestCase):
         # Frame 1 comes before the background and goes straight out; TrackNet's first window, frames 2-9,
         # finishes the 4 frames that no later window will see.
         self.assertEqual(early, [1, 2, 3, 4, 5])
+        self.assertEqual(live.done_through, 5)
         records = live.finish()
         self.assertEqual([record["frame"] for record in records], [6, 7, 8, 9])
+        self.assertEqual(live.done_through, 9)
         self.assertTrue(all(record["shuttlecock"]["image"] == [507.0, 255.0] for record in records))
 
     def test_a_cut_away_from_the_court_finishes_the_frames_waiting_for_trackNet(self):

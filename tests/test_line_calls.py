@@ -2,12 +2,14 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import asdict
 
 import numpy as np
 
 from badminton_analysis.analysis.line_calls import (
     TRACKNET_CSV,
     LineCallConfig,
+    LiveLineCaller,
     call_landing,
     compute_line_calls,
     load_run,
@@ -251,6 +253,55 @@ class ComputeLineCallsTests(unittest.TestCase):
         for call in calls:
             self.assertEqual((call.call, call.landing_side), ("in", "upper"))
             self.assertAlmostEqual(call.landing_court[1], 2.0, delta=0.3)
+
+
+class LiveLineCallerTests(unittest.TestCase):
+    def setUp(self):
+        self.match = SyntheticMatch()
+        self.match.idle(1)
+
+    def offline(self):
+        return [asdict(call) for call in compute_line_calls(METADATA, self.match.records, LineCallConfig())]
+
+    def live(self):
+        caller = LiveLineCaller(METADATA)
+        made = [(call, record["time_sec"]) for record in self.match.records
+                for call in caller.update([record], record["time_sec"])]
+        self.assertEqual(caller.finish(), [])
+        return made
+
+    def test_each_rally_is_called_as_in_the_whole_run_once_the_shuttle_has_rested(self):
+        self.match.rally((3.0, 12.0), (3.0, 2.0), settle_seconds=4.0)
+        self.match.rally((3.0, 2.0), (3.0, 14.0), settle_seconds=4.0)
+        made = self.live()
+        self.assertEqual([asdict(call) for call, _ in made], self.offline())
+        self.assertEqual([call.call for call, _ in made], ["in", "out"])
+        for call, at in made:   # rest_window and two samples after it, checked every 0.2 s
+            self.assertTrue(2.5 < at - call.end_sec < 2.75)
+
+    def test_a_rally_is_called_while_the_picture_shows_something_else(self):
+        self.match.rally((3.0, 12.0), (3.0, 2.0), settle_seconds=0.5)
+        caller = LiveLineCaller(METADATA)
+        end = self.match.records[-1]["time_sec"]
+        self.assertEqual(caller.update(self.match.records, end), [])
+        # A broadcast cuts to a replay: no records come, but time goes on.
+        self.assertEqual([asdict(call) for call in caller.update([], end + 3.0)], self.offline())
+
+    def test_a_rally_is_called_without_waiting_for_the_next_flight_to_end(self):
+        self.match.rally((3.0, 12.0), (3.0, 2.0), settle_seconds=0.5)
+        self.match.idle(0.6)   # picked up
+        self.match.rally((3.0, 2.0), (3.0, 12.0), settle_seconds=3.0)
+        made = self.live()
+        self.assertEqual([asdict(call) for call, _ in made], self.offline())
+        first, at = made[0]
+        self.assertLess(at - first.end_sec, 2.75)   # the next flight goes on until 3.1 s
+
+    def test_a_shuttle_picked_up_after_rest_window_landed_on_the_floor(self):
+        self.match.rally((3.0, 12.0), (3.0, 2.0), settle_seconds=2.5)
+        rest = self.match.records[-1]["shuttlecock"]["image"]
+        for _ in range(15):   # a player's hand comes to the resting shuttle
+            self.match._add(shuttle=rest, hand=[rest[0] + 5, rest[1] - 5])
+        self.assertEqual([call["landing_method"] for call in self.offline()], ["settled"])
 
 
 class LoadRunTests(unittest.TestCase):
