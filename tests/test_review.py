@@ -4,6 +4,7 @@ import unittest
 
 from badminton_analysis.analysis.line_calls import RallyCall
 from badminton_analysis.analysis.review import NOT_A_RALLY, ReviewSession, load_session, save_session
+from badminton_analysis.analysis.review_web import ReviewApp
 from badminton_analysis.analysis.scoring import score_rallies
 
 
@@ -73,6 +74,33 @@ class ReviewSessionTests(unittest.TestCase):
     def test_decisions_for_rallies_that_no_longer_exist_are_dropped(self):
         session = ReviewSession(CALLS, decisions={"1": "upper", "99": "lower"})
         self.assertEqual(session.decisions, {1: "upper"})
+
+
+class ReviewWebTests(unittest.TestCase):
+    def app(self, court_frames):
+        metadata = {"video": {"fps": 10.0, "width": 1280, "height": 720}}
+        calls = [RallyCall(rally=1, start_frame=11, end_frame=101, start_sec=1.0, end_sec=10.0,
+                           landing_frame=104, landing_image=[600.0, 400.0], landing_side="upper",
+                           call="in", confidence="high")]
+        return ReviewApp(tempfile.mkdtemp(), "video.mp4", ReviewSession(calls), metadata, calls,
+                         court_frames=court_frames)
+
+    def test_clip_covers_the_end_of_the_rally_and_the_landing(self):
+        rally = self.app(range(1, 200)).state()["rallies"][0]
+        self.assertEqual((rally["clip_start"], rally["landing_time"], rally["clip_end"]), (7.3, 10.3, 11.8))
+
+    def test_clip_stops_when_the_broadcast_cuts_away_from_the_court(self):
+        rally = self.app(range(1, 107)).state()["rallies"][0]
+        self.assertEqual(rally["clip_end"], 10.5)
+
+    def test_decisions_are_saved(self):
+        app = self.app(range(1, 200))
+        app.decide(0, "far")
+        state = app.state()
+        self.assertEqual((state["reviewed"], state["changed"]), (1, 1))
+        self.assertTrue(os.path.exists(os.path.join(app.output_dir, "review.json")))
+        with self.assertRaises(ValueError):
+            app.decide(0, "sideways")
 
 
 if __name__ == "__main__":

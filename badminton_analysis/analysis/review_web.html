@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rally Review</title>
+<style>
+  :root {
+    --bg: #f4f5f2; --panel: #ffffff; --ink: #1d2320; --muted: #66706b; --line: #dfe3df;
+    --court: #2f6b3a; --court-line: #f5f7f2; --in: #2f9e5b; --out: #d64545; --accent: #2563eb;
+    --far: #c2410c; --near: #0e7490; --warn: #b45309; --chip: #eef1ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121614; --panel: #1b201d; --ink: #e8ece9; --muted: #98a29d; --line: #2c332f;
+      --court: #24543a; --court-line: #dfe7e1; --in: #4ade80; --out: #f87171; --accent: #60a5fa;
+      --far: #fb923c; --near: #22d3ee; --warn: #fbbf24; --chip: #232a26;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 24px; padding: 16px 20px 8px; }
+  header h1 { font-size: 18px; margin: 0; }
+  .score { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 8px 20px 24px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+  /* Just under 1 opacity keeps the video out of the hardware overlay plane, which would hide the marker. */
+  video { display: block; width: 100%; opacity: .999; }
+  .marker { position: absolute; width: 7%; aspect-ratio: 1; transform: translate(-50%, -50%);
+            border: 4px solid var(--in); border-radius: 50%; pointer-events: none; display: none; }
+  .marker.out { border-color: var(--out); }
+  .marker span { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: 4px;
+                 font: 700 14px sans-serif; color: var(--in); text-shadow: 0 0 3px #000, 0 0 3px #000; }
+  .marker.out span { color: var(--out); }
+  .marker.lost { border: 3px dashed #c8ccc9; }
+  .marker.lost span { color: #e5e7e6; font-size: 12px; white-space: nowrap; }
+  .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0 6px; flex-wrap: wrap; }
+  .bar h2 { margin: 0; font-size: 16px; }
+  .sides { display: flex; gap: 16px; flex-wrap: wrap; }
+  .side-far { color: var(--far); font-weight: 600; }
+  .side-near { color: var(--near); font-weight: 600; }
+  .call { font-size: 16px; margin: 4px 0; }
+  .call b.in { color: var(--in); } .call b.out { color: var(--out); } .call b.lost { color: var(--muted); }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--chip); font-size: 12px; }
+  .chip.high { color: var(--in); } .chip.medium { color: var(--warn); } .chip.low { color: var(--out); }
+  .flags { margin: 6px 0 0; padding-left: 18px; color: var(--warn); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+           border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button kbd { font: 11px ui-monospace, monospace; opacity: .75; margin-left: 6px; }
+  .decision { margin-top: 10px; font-weight: 600; color: var(--accent); min-height: 20px; }
+  aside { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  aside h3 { margin: 0 0 8px; font-size: 14px; }
+  svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; gap: 12px; font-size: 12px; margin-top: 6px; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  .list { max-height: 360px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+  tr { cursor: pointer; } tr.current { background: var(--chip); }
+  .st-auto { color: var(--muted); } .st-ok { color: var(--in); } .st-changed { color: var(--warn); }
+  .progress { height: 6px; background: var(--chip); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+  .progress div { height: 100%; background: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rally Review</h1>
+  <span class="score" id="score">–</span>
+  <span class="muted" id="summary"></span>
+</header>
+<main>
+  <section class="card">
+    <div class="stage">
+      <video id="video" src="/video" preload="auto" muted playsinline></video>
+      <div class="marker" id="marker"><span></span></div>
+    </div>
+    <div class="bar">
+      <h2 id="title">Loading…</h2>
+      <div class="sides"><span>Far: <span class="side-far" id="far"></span></span>
+        <span>Near: <span class="side-near" id="near"></span></span></div>
+    </div>
+    <div class="call" id="call"></div>
+    <div id="auto"></div>
+    <ul class="flags" id="flags"></ul>
+    <div class="actions">
+      <button class="primary" data-choice="accept">Accept<kbd>Enter</kbd></button>
+      <button data-choice="near">Near won<kbd>N</kbd></button>
+      <button data-choice="far">Far won<kbd>F</kbd></button>
+      <button data-choice="none">Not a rally<kbd>X</kbd></button>
+      <button id="replay">Replay<kbd>R</kbd></button>
+      <button id="prev">Back<kbd>B / ←</kbd></button>
+      <button id="next">Skip<kbd>→</kbd></button>
+    </div>
+    <div class="decision" id="decision"></div>
+  </section>
+  <aside>
+    <div class="card">
+      <h3>Landings</h3>
+      <svg id="court" viewBox="-1.6 -1.6 9.3 16.6"></svg>
+      <div class="legend"><span><span class="dot" style="background:var(--in)"></span>in</span>
+        <span><span class="dot" style="background:var(--out)"></span>out</span>
+        <span><span class="dot" style="border:1.5px solid var(--muted)"></span>lost in flight</span>
+        <span class="muted">click a dot to open its rally</span></div>
+    </div>
+    <div class="card">
+      <h3>Rallies</h3>
+      <div class="progress"><div id="bar" style="width:0"></div></div>
+      <div class="list"><table><thead><tr><th>#</th><th>Call</th><th>Winner</th><th>Score</th><th></th></tr></thead>
+        <tbody id="rows"></tbody></table></div>
+    </div>
+  </aside>
+</main>
+<script>
+const W = 6.1, L = 13.4, NET = 6.7, SM = 0.46, SL = 1.98, BS = 0.76;
+const video = document.getElementById("video");
+const $ = id => document.getElementById(id);
+let state = null, current = 0;
+
+const sideLabel = s => s === "upper" ? "far" : "near";
+// Lost in flight: the position is where the shuttle was last tracked in the air, not where it
+// landed. Mapped to the floor it often ends up on the wrong side, so it is not shown as a landing.
+const lost = r => r.landing_method === "last_seen";
+const hasLanding = r => r.landing_court && (r.call === "in" || r.call === "out");
+const winnerText = (side, r) => side ? `${r.sides[side]} (${sideLabel(side)})` : "–";
+
+async function load() {
+  state = await (await fetch("/api/state")).json();
+  drawCourt();
+  select(Math.min(state.next_index, state.rallies.length - 1), true);
+}
+
+function render() {
+  const r = state.rallies[current];
+  const [a, b] = state.names;
+  $("score").textContent = `${a} ${state.final_score} ${b}`;
+  $("summary").textContent = `${state.reviewed}/${state.rallies.length} reviewed · ${state.changed} automatic calls changed`;
+  $("bar").style.width = `${100 * state.reviewed / state.rallies.length}%`;
+  $("title").textContent = `Rally ${current + 1}/${state.rallies.length} · Game ${r.game} · ${a} ${r.score_before[0]}–${r.score_before[1]} ${b}`;
+  $("far").textContent = r.sides.upper;
+  $("near").textContent = r.sides.lower;
+  if (hasLanding(r) && lost(r)) {
+    $("call").innerHTML = `<b class="lost">Landing not seen</b>: shuttle lost in flight` +
+      ` <span class="muted">(automatic guess: ${r.call} on the ${sideLabel(r.landing_side)} side)</span>`;
+  } else if (r.call === "in" || r.call === "out") {
+    const margin = r.margin_m == null ? "" : ` by ${Math.abs(r.margin_m).toFixed(2)} m`;
+    $("call").innerHTML = `Shuttle <b class="${r.call}">${r.call.toUpperCase()}</b> on the ${sideLabel(r.landing_side)} side${margin}`;
+  } else {
+    $("call").textContent = "No landing found";
+  }
+  const guess = lost(r) ? " (guess)" : "";
+  $("auto").innerHTML = `Automatic: <b>${r.predicted_side ? winnerText(r.predicted_side, r) + " wins" + guess : "undecided"}</b> ` +
+    `<span class="chip ${r.confidence}">${r.confidence} confidence</span>`;
+  $("flags").innerHTML = r.flags.map(f => `<li>${f}</li>`).join("");
+  $("decision").textContent = r.decision == null ? "" :
+    r.decision === "none" ? "Your call: not a rally" : `Your call: ${winnerText(r.decision, r)} wins`;
+  renderRows();
+  highlightCourt();
+}
+
+function renderRows() {
+  $("rows").innerHTML = state.rallies.map((r, i) => {
+    const call = !hasLanding(r) ? "–" : lost(r) ? "not seen" : `${r.call} ${sideLabel(r.landing_side)}`;
+    const st = !r.reviewed ? ["auto", "st-auto"] : r.changed ? ["changed", "st-changed"] : ["✓", "st-ok"];
+    const score = r.score_after ? r.score_after.join("–") : "–";
+    const who = r.winner_side ? r.sides[r.winner_side] : (r.decision === "none" ? "not a rally" : "?");
+    return `<tr data-i="${i}" class="${i === current ? "current" : ""}"><td>${i + 1}</td><td>${call}</td>` +
+      `<td>${who}</td><td>${score}</td><td class="${st[1]}">${st[0]}</td></tr>`;
+  }).join("");
+  // Scroll only the list, not the page, so the video stays in view.
+  const row = $("rows").querySelector("tr.current"), list = row && row.closest(".list");
+  if (row && (row.offsetTop < list.scrollTop + 30 || row.offsetTop > list.scrollTop + list.clientHeight - 30)) {
+    list.scrollTop = row.offsetTop - list.clientHeight / 2;
+  }
+}
+
+function drawCourt() {
+  const svg = $("court");
+  const line = (x1, y1, x2, y2, extra = "") =>
+    `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--court-line)" stroke-width="0.05" ${extra}/>`;
+  let html = `<rect x="-1.6" y="-1.6" width="9.3" height="16.6" fill="var(--panel)"/>` +
+    `<rect x="0" y="0" width="${W}" height="${L}" fill="var(--court)"/>`;
+  html += line(0, 0, W, 0) + line(W, 0, W, L) + line(W, L, 0, L) + line(0, L, 0, 0);
+  html += line(SM, 0, SM, L) + line(W - SM, 0, W - SM, L);
+  html += line(0, NET - SL, W, NET - SL) + line(0, NET + SL, W, NET + SL);
+  html += line(0, BS, W, BS) + line(0, L - BS, W, L - BS);
+  html += line(W / 2, 0, W / 2, NET - SL) + line(W / 2, NET + SL, W / 2, L);
+  html += line(-0.3, NET, W + 0.3, NET, 'stroke-width="0.09" stroke-dasharray="0.15 0.1"');
+  html += `<text x="${W / 2}" y="-0.5" font-size="0.5" text-anchor="middle" fill="var(--muted)">far</text>`;
+  html += `<text x="${W / 2}" y="${L + 0.9}" font-size="0.5" text-anchor="middle" fill="var(--muted)">near</text>`;
+  state.rallies.forEach((r, i) => {
+    if (!hasLanding(r)) return;
+    const x = Math.max(-1.4, Math.min(r.landing_court[0], 7.5));
+    const y = Math.max(-1.4, Math.min(r.landing_court[1], 14.8));
+    html += lost(r)
+      ? `<circle data-i="${i}" cx="${x}" cy="${y}" r="0.14" fill="var(--panel)" fill-opacity="0.01" stroke="var(--muted)" stroke-width="0.06" style="cursor:pointer"/>`
+      : `<circle data-i="${i}" cx="${x}" cy="${y}" r="0.16" fill="var(--${r.call})" stroke="var(--panel)" stroke-width="0.04" style="cursor:pointer"/>`;
+  });
+  html += `<circle id="cur" r="0.34" fill="none" stroke="var(--accent)" stroke-width="0.08" visibility="hidden"/>`;
+  svg.innerHTML = html;
+}
+
+function highlightCourt() {
+  const r = state.rallies[current], cur = $("cur");
+  if (hasLanding(r)) {
+    cur.setAttribute("cx", Math.max(-1.4, Math.min(r.landing_court[0], 7.5)));
+    cur.setAttribute("cy", Math.max(-1.4, Math.min(r.landing_court[1], 14.8)));
+    cur.setAttribute("visibility", "visible");
+  } else cur.setAttribute("visibility", "hidden");
+}
+
+function select(i, play = true) {
+  current = Math.max(0, Math.min(i, state.rallies.length - 1));
+  render();
+  if (play) replay();
+}
+
+function replay() {
+  const r = state.rallies[current];
+  video.currentTime = r.clip_start;
+  video.play().catch(() => {});
+}
+
+function updateMarker() {
+  const r = state && state.rallies[current], m = $("marker");
+  const show = r && r.landing_image && r.landing_time != null &&
+    video.currentTime >= r.landing_time - 0.02 && video.currentTime <= r.clip_end + 0.05;
+  if (show) {
+    m.style.left = `${100 * r.landing_image[0] / state.video.width}%`;
+    m.style.top = `${100 * r.landing_image[1] / state.video.height}%`;
+    m.className = `marker ${lost(r) ? "lost" : r.call}`;
+    m.firstChild.textContent = lost(r) ? "LAST SEEN" : r.call.toUpperCase();
+  }
+  m.style.display = show ? "block" : "none";
+}
+
+function drawOverlay() {
+  updateMarker();
+  stopAtClipEnd();
+  requestAnimationFrame(drawOverlay);
+}
+
+function stopAtClipEnd() {
+  const r = state && state.rallies[current];
+  if (r && !video.paused && video.currentTime >= r.clip_end) {
+    video.pause();
+    video.currentTime = r.clip_end;  // hold the last court-camera frame
+  }
+}
+// timeupdate keeps firing when the tab is in the background, unlike requestAnimationFrame.
+video.addEventListener("timeupdate", stopAtClipEnd);
+video.addEventListener("seeked", updateMarker);
+video.addEventListener("pause", updateMarker);
+
+async function decide(choice) {
+  const res = await fetch("/api/decide", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ index: current, choice }) });
+  const data = await res.json();
+  if (!res.ok) { $("decision").textContent = data.error === "no automatic call to accept"
+      ? "No automatic call here: pick Near won, Far won or Not a rally." : data.error; return; }
+  state = data;
+  drawCourt();
+  select(current + 1);
+}
+
+document.querySelectorAll("button[data-choice]").forEach(b => b.onclick = () => decide(b.dataset.choice));
+$("replay").onclick = replay;
+$("prev").onclick = () => select(current - 1);
+$("next").onclick = () => select(current + 1);
+$("rows").onclick = e => { const tr = e.target.closest("tr"); if (tr) select(+tr.dataset.i); };
+$("court").onclick = e => { const i = e.target.getAttribute("data-i"); if (i != null) select(+i); };
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  const act = { enter: () => decide("accept"), " ": () => decide("accept"), n: () => decide("near"),
+    f: () => decide("far"), x: () => decide("none"), r: replay, b: () => select(current - 1),
+    arrowleft: () => select(current - 1), arrowright: () => select(current + 1) }[k];
+  if (act) { e.preventDefault(); act(); }
+});
+requestAnimationFrame(drawOverlay);
+load();
+</script>
+</body>
+</html>

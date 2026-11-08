@@ -301,6 +301,15 @@ python -m badminton_analysis.analysis.review outputs/<video_name> --names "Lee,T
 - `--skip-high` accepts high-confidence calls without showing them.
 - Decisions are saved to `review.json` after every key; the score is in `review_report.json`.
 
+The same review runs in the browser, with the landing marked on the video, a court map of every landing, and the rally list with the running score:
+
+```bash
+python -m badminton_analysis.analysis.review_web outputs/<video_name> --names "Lee,Tan" --player1-side lower
+# then open http://127.0.0.1:8765
+```
+
+It uses the same keys plus ← / → to move between rallies, and saves to the same files, so you can switch between the two.
+
 ## 📊 Outputs
 
 Default output directory: `outputs/<video_name>/`.
@@ -324,6 +333,7 @@ Default output directory: `outputs/<video_name>/`.
 main.py              # CLI entry and argument parsing; keeps python main.py ... usage
 badminton_analysis/
 ├── system.py        # Main video analysis pipeline: BadmintonAnalysisSystem
+├── analysis/        # Line calls, scoring and rally review
 ├── court/           # Court annotation and coordinate mapping
 ├── data/            # JSON / JSONL output
 ├── detection/       # Shuttlecock detection and pose detection

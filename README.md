@@ -299,6 +299,15 @@ python -m badminton_analysis.analysis.review outputs/<视频名> --names "Lee,Ta
 - `--skip-high` 会直接接受高置信度的判定，不再逐个显示。
 - 每按一次键都会把决定保存到 `review.json`；比分保存在 `review_report.json`。
 
+同样的复核也可以在浏览器中进行：视频上标出落点，并显示所有落点的球场图和带实时比分的回合列表：
+
+```bash
+python -m badminton_analysis.analysis.review_web outputs/<视频名> --names "Lee,Tan" --player1-side lower
+# 然后打开 http://127.0.0.1:8765
+```
+
+按键相同，另可用 ← / → 切换回合；保存到相同的文件，两种方式可以随时切换。
+
 ## 📊 输出结果
 
 默认输出到 `outputs/<视频文件名>/`：
@@ -322,6 +331,7 @@ python -m badminton_analysis.analysis.review outputs/<视频名> --names "Lee,Ta
 main.py              # 命令行入口和参数解析，保持 python main.py ... 的运行方式
 badminton_analysis/
 ├── system.py        # 视频分析主流程 BadmintonAnalysisSystem
+├── analysis/        # 落点判定、计分与回合复核
 ├── court/           # 球场标注与坐标映射
 ├── data/            # JSON / JSONL 输出
 ├── detection/       # 羽毛球检测与姿态检测

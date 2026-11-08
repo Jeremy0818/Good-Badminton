@@ -80,7 +80,8 @@ class ReviewSession:
                    "reviewed": call.rally in self.decisions,
                    "changed": call.rally in self.decisions and side != self.predicted_side(index),
                    "winner_side": None if side == NOT_A_RALLY else side,
-                   "winner": None, "score_after": None, "game": None}
+                   "winner": None, "score_before": list(match.points), "score_after": None,
+                   "game": match.game_number, "sides": self.side_names(match)}
             if side in ("upper", "lower") and not match.match_over:
                 row["winner"] = match.player_on(side)
                 event = match.award(row["winner"])
