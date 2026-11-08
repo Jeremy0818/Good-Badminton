@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone camera</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --panel: #fff; --line: #dfe3e8; --text: #1d2125;
+          --muted: #5f6873; --red: #d93036; --green: #1f8f55; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d0f12; --panel: #181b20; --line: #2c313a; --text: #e8eaed; --muted: #9aa0a6;
+            --red: #e5484d; --green: #3dd68c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 14px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+  code { font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .urls div { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
+  button { font: inherit; font-size: 13px; color: inherit; background: transparent; border: 1px solid var(--line);
+           border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+  #live { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+  @media (max-width: 720px) { #live { grid-template-columns: 1fr; } }
+  .frame { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+  .frame span { position: absolute; inset: 0; display: grid; place-items: center; color: #9aa0a6; font-size: 14px; }
+  #picture { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #picture:not([src]) { display: none; }
+  #state { font-weight: 600; }
+  #state.rec { color: var(--red); }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0 0; font-size: 14px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #errors { color: var(--red); font-size: 13px; white-space: pre-wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td, th { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Phone camera</h1>
+  <section>
+    <h2>Open on the phone</h2>
+    <div class="urls" id="urls"></div>
+    <p class="muted">The phone needs the same Wi-Fi as this computer. At a hall, turn on the iPhone's Personal Hotspot
+      and join this computer to it (video stays local and uses no mobile data). Safari warns once that the connection
+      is not private: Show Details › visit this website. Hold the phone sideways and keep it on a stand.
+      To try without a phone: <a href="/camera">this computer's camera</a> or <a href="/camera?test=1">test pattern</a>.</p>
+  </section>
+  <section id="live">
+    <div class="frame"><span>No video yet</span><img id="picture" alt="Latest picture received from the phone"></div>
+    <div>
+      <div id="state">Waiting for the phone</div>
+      <dl id="stats"></dl>
+      <div id="errors"></div>
+    </div>
+  </section>
+  <section>
+    <h2>Recordings</h2>
+    <table><thead><tr><th>Started</th><th>Length</th><th>Size</th><th>File</th></tr></thead><tbody id="list"></tbody></table>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const mb = bytes => (bytes / 1e6).toFixed(1) + ' MB';
+const clock = seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+const started = id => id.replace(/^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d).*/, '$1-$2-$3 $4:$5:$6');
+let shownUrls = '';
+
+function cell(text) { return Object.assign(document.createElement('td'), {textContent: text}); }
+
+function render(status) {
+  const urls = JSON.stringify(status.phone_urls);
+  if (urls !== shownUrls) {
+    shownUrls = urls;
+    $('urls').replaceChildren(...status.phone_urls.map(url => {
+      const row = document.createElement('div');
+      const copy = Object.assign(document.createElement('button'), {textContent: 'Copy'});
+      copy.onclick = () => navigator.clipboard.writeText(url).then(() => { copy.textContent = 'Copied'; });
+      row.append(Object.assign(document.createElement('code'), {textContent: url}), copy);
+      return row;
+    }));
+  }
+  const session = status.session;
+  $('state').textContent = status.recording ? 'Recording' : session ? 'Stopped' : 'Waiting for the phone';
+  $('state').className = status.recording ? 'rec' : '';
+  const rows = session ? [
+    ['Recording', session.id],
+    ['Camera', `${session.info.camera || '?'} · ${session.info.width}×${session.info.height} @ ${session.fps} fps`],
+    ['Length', clock(session.seconds)],
+    ['Received', `${mb(session.bytes)} in ${session.pieces} pieces` + (session.gaps ? ` · ${session.gaps} missing` : '')],
+    ['Decoded', `${session.frames} frames (${clock(session.decoded_seconds)})` + (session.size ? ` · ${session.size[0]}×${session.size[1]}` : '')],
+    ['Behind live', status.recording ? `${session.delay} s` : '–'],
+    ['Saved', session.saved_path || (session.stopped ? 'saving…' : '–')],
+  ] : [];
+  $('stats').replaceChildren(...rows.flatMap(([name, value]) => [
+    Object.assign(document.createElement('dt'), {textContent: name}),
+    Object.assign(document.createElement('dd'), {textContent: value}),
+  ]));
+  $('errors').textContent = session ? [...session.decoder_errors, session.error || ''].join('\n').trim() : '';
+  $('list').replaceChildren(...status.recordings.map(item => {
+    const row = document.createElement('tr');
+    const live = status.recording && session && item.id === session.id;
+    row.append(cell(started(item.id)), cell(clock(item.seconds || 0)), cell(mb(item.bytes || 0)),
+               cell(item.error ? 'error: ' + item.error : item.saved_path || (live ? 'recording…' : 'not finished')));
+    return row;
+  }));
+}
+
+async function refresh() {
+  let status = null;
+  try { status = await (await fetch('api/status')).json(); render(status); }
+  catch (error) { $('state').textContent = 'Server stopped'; }
+  const live = Boolean(status && status.recording);
+  // While recording, a new picture every half second; afterwards keep the last one.
+  if (live || (status && status.session && !$('picture').getAttribute('src'))) {
+    $('picture').src = 'preview.jpg?t=' + Date.now();
+  }
+  setTimeout(refresh, live ? 500 : 1500);
+}
+$('picture').onerror = () => $('picture').removeAttribute('src');
+refresh();
+</script>
+</body>
+</html>

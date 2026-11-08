@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Badminton camera</title>
+<style>
+  :root { color-scheme: dark; --bg: #0d0f12; --panel: #181b20; --line: #333944; --text: #e8eaed;
+          --muted: #9aa0a6; --red: #e5484d; --green: #3dd68c; --amber: #f5a524; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 15px/1.35 -apple-system, system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #view { position: relative; flex: 1; min-height: 0; background: #000; }
+  video { width: 100%; height: 100%; object-fit: contain; }
+  #badge { position: absolute; top: 10px; left: 10px; padding: 4px 10px; border-radius: 6px;
+           background: rgba(0, 0, 0, .6); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #badge.rec { background: var(--red); }
+  #remote { position: absolute; top: 10px; right: 10px; padding: 4px 10px; border-radius: 6px;
+            background: rgba(0, 0, 0, .6); font-size: 13px; color: var(--muted); }
+  #remote:empty { display: none; }
+  #bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); background: var(--panel); }
+  button, select { font: inherit; color: inherit; background: #262a31; border: 1px solid var(--line);
+                   border-radius: 8px; padding: 8px 12px; }
+  #go { background: var(--green); color: #04140b; font-weight: 700; min-width: 110px; border: 0; }
+  #go.stop { background: var(--red); color: #fff; }
+  #go:disabled, select:disabled { opacity: .5; }
+  label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  input[type=range] { width: 120px; }
+  #info, #msg { width: 100%; font-size: 13px; color: var(--muted); }
+  #msg:empty { display: none; }
+  #msg.warn { color: var(--amber); }
+  #msg.bad { color: var(--red); }
+</style>
+</head>
+<body>
+<div id="view">
+  <video id="preview" playsinline muted autoplay></video>
+  <div id="badge">Ready</div>
+  <div id="remote"></div>
+</div>
+<div id="bar">
+  <button id="go" disabled>Start</button>
+  <select id="camera" title="Camera"></select>
+  <select id="quality" title="Quality">
+    <option value="1920x1080x60" selected>1080p 60</option>
+    <option value="1920x1080x30">1080p 30</option>
+    <option value="1280x720x60">720p 60</option>
+    <option value="1280x720x30">720p 30</option>
+  </select>
+  <label id="zoombox" hidden>Zoom <input id="zoom" type="range"><span id="zoomval"></span></label>
+  <label><input id="audio" type="checkbox" checked> Sound</label>
+  <div id="info"></div>
+  <div id="msg"></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const key = params.get('k') || '';
+const testPattern = params.has('test');
+let stream = null, recorder = null, session = null, seq = 0, sent = 0, startedAt = 0;
+let sending = false, stopping = false, wakeLock = null;
+const queue = [];
+
+function say(text, kind = '') { $('msg').textContent = text; $('msg').className = kind; }
+const recording = () => recorder && recorder.state === 'recording';
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function api(path, body, type = 'application/json') {
+  const response = await fetch(path, {method: 'POST', headers: {'X-Key': key, 'Content-Type': type}, body});
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+function patternStream() {
+  // Moving dot and a clock, for trying the upload without a camera.
+  const canvas = Object.assign(document.createElement('canvas'), {width: 1280, height: 720});
+  const g = canvas.getContext('2d');
+  const t0 = performance.now();
+  setInterval(() => {  // a timer, not requestAnimationFrame, so it keeps drawing in a background tab
+    const t = (performance.now() - t0) / 1000;
+    g.fillStyle = '#1b5e20'; g.fillRect(0, 0, 1280, 720);
+    g.fillStyle = '#fff'; g.beginPath();
+    g.arc(640 + 500 * Math.sin(t * 2), 620 - 450 * Math.abs(Math.sin(t * 3)), 14, 0, 2 * Math.PI); g.fill();
+    g.font = '48px sans-serif'; g.fillText(t.toFixed(2) + ' s', 40, 80);
+  }, 1000 / 30);
+  return canvas.captureStream(30);
+}
+
+async function openCamera() {
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  if (testPattern) {
+    stream = patternStream();
+  } else {
+    const [width, height, fps] = $('quality').value.split('x').map(Number);
+    const video = {width: {ideal: width}, height: {ideal: height}, frameRate: {ideal: fps}};
+    if ($('camera').value) video.deviceId = {exact: $('camera').value};
+    else video.facingMode = {ideal: 'environment'};
+    // Raw sound: hits are short clicks that noise suppression would remove.
+    const audio = $('audio').checked && {echoCancellation: false, noiseSuppression: false, autoGainControl: false};
+    stream = await navigator.mediaDevices.getUserMedia({video, audio});
+  }
+  $('preview').srcObject = stream;
+  await listCameras();
+  setupZoom();
+  showInfo();
+}
+
+async function listCameras() {
+  const select = $('camera');
+  if (testPattern) {
+    select.replaceChildren(Object.assign(document.createElement('option'), {value: '', textContent: 'Test pattern'}));
+    return;
+  }
+  const current = stream.getVideoTracks()[0].getSettings().deviceId;
+  const cameras = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput');
+  select.replaceChildren(...cameras.map((camera, i) =>
+    Object.assign(document.createElement('option'), {value: camera.deviceId, textContent: camera.label || `Camera ${i + 1}`})));
+  if (current) select.value = current;
+}
+
+function setupZoom() {
+  const track = stream.getVideoTracks()[0];
+  const zoom = !testPattern && track.getCapabilities ? track.getCapabilities().zoom : null;
+  $('zoombox').hidden = !zoom;
+  if (!zoom) return;
+  Object.assign($('zoom'), {min: zoom.min, max: zoom.max, step: zoom.step || 0.1});
+  $('zoom').value = track.getSettings().zoom || zoom.min;
+  $('zoomval').textContent = Number($('zoom').value).toFixed(1);
+}
+
+function showInfo() {
+  const track = stream.getVideoTracks()[0];
+  const settings = track.getSettings();
+  const zoom = !testPattern && track.getCapabilities ? track.getCapabilities().zoom : null;
+  const name = testPattern ? 'Test pattern' : track.label || 'camera';
+  $('info').textContent = `${name} · ${settings.width}×${settings.height} @ ${Math.round(settings.frameRate || 0)} fps`
+    + (zoom ? ` · zoom ${zoom.min}–${zoom.max}` : '');
+}
+
+$('preview').addEventListener('resize', () => {
+  const video = $('preview');
+  if (video.videoHeight > video.videoWidth) say('Turn the phone sideways (landscape) before you start.', 'warn');
+  else if ($('msg').className === 'warn') say('');
+});
+
+$('zoom').oninput = async () => {
+  const value = Number($('zoom').value);
+  $('zoomval').textContent = value.toFixed(1);
+  try { await stream.getVideoTracks()[0].applyConstraints({advanced: [{zoom: value}]}); }
+  catch (error) { say('Zoom: ' + error.message, 'warn'); }
+};
+
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request('screen'); }
+  catch (error) { say('Keep the screen on: Settings > Display & Brightness > Auto-Lock > Never.', 'warn'); }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && recording()) keepAwake();
+});
+
+async function start() {
+  $('go').disabled = true;
+  try {
+    // iPhone: MP4 uses the hardware H.264 encoder. Chrome: WebM, because its MP4 pieces come only every few seconds.
+    const mp4 = ['video/mp4;codecs=avc1', 'video/mp4'], webm = ['video/webm;codecs=vp9', 'video/webm'];
+    const mime = (navigator.vendor === 'Apple Computer, Inc.' ? [...mp4, ...webm] : [...webm, ...mp4])
+      .find(type => window.MediaRecorder && MediaRecorder.isTypeSupported(type));
+    if (!mime) throw new Error('this browser cannot record video');
+    const track = stream.getVideoTracks()[0];
+    const settings = track.getSettings();
+    const width = $('preview').videoWidth || settings.width, height = $('preview').videoHeight || settings.height;
+    const fps = Math.round(settings.frameRate || Number($('quality').value.split('x')[2]));
+    const bitrate = Math.round(Math.min(16e6, Math.max(3e6, width * height * fps * 0.1)));
+    ({session} = await api('api/start', JSON.stringify({
+      camera: testPattern ? 'Test pattern' : track.label, width, height, fps, mime, bitrate, zoom: settings.zoom || null,
+      user_agent: navigator.userAgent,
+    })));
+    recorder = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: bitrate});
+    seq = 0; sent = 0; stopping = false; queue.length = 0;
+    recorder.ondataavailable = event => {
+      if (event.data && event.data.size) { queue.push({n: seq++, blob: event.data}); pump(); }
+    };
+    recorder.onstop = () => { stopping = true; pump(); };
+    recorder.onerror = event => say('Recorder error: ' + (event.error ? event.error.message : event.name), 'bad');
+    track.onended = () => {
+      if (!recording()) return;
+      say('The camera was interrupted, so the recording stopped. Press Start to record again.', 'bad');
+      stop();
+    };
+    recorder.start(1000);  // a piece every second
+    startedAt = Date.now();
+    keepAwake();
+    say('');
+    setRecording(true);
+  } catch (error) {
+    say('Could not start: ' + error.message, 'bad');
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+function stop() {
+  if (recorder && recorder.state !== 'inactive') recorder.stop();  // sends the last piece, then onstop
+  setRecording(false);
+  $('go').disabled = true;  // until the last pieces are on the computer
+  if (wakeLock) wakeLock.release().catch(() => {});
+}
+
+async function pump() {
+  if (sending) return;
+  sending = true;
+  while (queue.length && session) {
+    const item = queue[0];
+    try {
+      await api(`api/piece?s=${session}&n=${item.n}`, item.blob, 'application/octet-stream');
+      queue.shift();
+      sent += item.blob.size;
+      if ($('msg').dataset.upload) { say(''); delete $('msg').dataset.upload; }
+    } catch (error) {
+      if (error.status === 404 || error.status === 403) {
+        say('The computer does not know this recording (was it restarted?). Press Start to record again.', 'bad');
+        queue.length = 0;
+        if (recording()) stop();
+        break;
+      }
+      say(`Sending is slow or failing (${error.message}). ${queue.length} s waiting, retrying.`, 'bad');
+      $('msg').dataset.upload = '1';
+      await sleep(1000);
+    }
+  }
+  sending = false;
+  if (stopping && !queue.length && session) {
+    const id = session;
+    session = null; stopping = false;
+    try { await api(`api/stop?s=${id}`, '{}'); say('Saved on the computer.'); }
+    catch (error) { say('Could not finish the recording: ' + error.message, 'bad'); }
+  }
+  if (!recording() && !queue.length) $('go').disabled = false;
+}
+
+function setRecording(on) {
+  $('go').textContent = on ? 'Stop' : 'Start';
+  $('go').classList.toggle('stop', on);
+  for (const id of ['camera', 'quality', 'audio']) $(id).disabled = on;
+}
+
+setInterval(() => {
+  const badge = $('badge');
+  badge.classList.toggle('rec', recording());
+  if (recording()) {
+    const s = Math.floor((Date.now() - startedAt) / 1000);
+    const clock = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    badge.textContent = `REC ${clock} · ${(sent / 1e6).toFixed(1)} MB sent` + (queue.length > 2 ? ` · ${queue.length} waiting` : '');
+  } else {
+    badge.textContent = queue.length ? `Sending last ${queue.length} s…` : 'Ready';
+  }
+}, 500);
+
+setInterval(async () => {
+  // Confirms the computer is receiving and decoding.
+  if (!recording()) { $('remote').textContent = ''; return; }
+  try {
+    const response = await fetch('api/status', {headers: {'X-Key': key}});
+    const status = await response.json();
+    const current = status.session;
+    $('remote').textContent = current && current.frames
+      ? `Computer: ${current.frames} frames, ${current.delay} s behind` : 'Computer: waiting for video';
+  } catch (error) {
+    $('remote').textContent = 'Computer: not reachable';
+  }
+}, 3000);
+
+$('go').onclick = () => recording() ? stop() : start();
+for (const id of ['camera', 'quality', 'audio']) {
+  $(id).onchange = () => openCamera().catch(error => say('Camera: ' + error.message, 'bad'));
+}
+
+(async () => {
+  if (!testPattern && (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)) {
+    say('Open this page with https:// and accept the certificate warning, or the camera stays off.', 'bad');
+    return;
+  }
+  if (!key && location.hostname !== '127.0.0.1' && location.hostname !== 'localhost') {
+    say('Open the full address shown on the computer (it ends with ?k=…).', 'bad');
+    return;
+  }
+  try {
+    await openCamera();
+    $('go').disabled = false;
+  } catch (error) {
+    say(`Camera: ${error.message}. Allow camera access for this site (Settings > Apps > Safari > Camera).`, 'bad');
+  }
+})();
+</script>
+</body>
+</html>

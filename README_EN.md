@@ -310,6 +310,22 @@ python -m badminton_analysis.analysis.review_web outputs/<video_name> --names "L
 
 It uses the same keys plus ← / → to move between rallies, and saves to the same files, so you can switch between the two.
 
+### Filming with a Phone (Experimental)
+
+The phone films and this computer records and decodes, so the phone only needs a browser (iPhone Safari or Android Chrome):
+
+```bash
+python -m badminton_analysis.live.capture
+# then open http://127.0.0.1:8080 on this computer
+```
+
+1. The page on the computer shows an address like `https://<computer>.local:8443/?k=…`. Open it on the phone. Phone and computer must be on the same Wi-Fi; at a hall, turn on the iPhone's Personal Hotspot and join the computer to it (the video stays between the two devices and uses no mobile data).
+2. The computer makes its own certificate, so Safari warns once that the connection is not private: Show Details › visit this website. Allow the camera and microphone (hit sounds are kept for later analysis).
+3. Put the phone sideways on a stand, pick the camera and quality, and press Start. Keep Safari open with the screen on (Auto-Lock › Never) and the phone on a power bank.
+4. The computer page shows the latest picture, how far decoding trails the phone, and missing pieces. Recordings are saved to `recordings/<date-time>/recording.mp4`, ready for `python main.py --video-path …`.
+
+Placement: beside the court in line with the net, as high as possible, with the whole court in the picture (usually the 0.5× camera, if the phone's browser offers it). From there every hit reverses the shuttle's direction across the picture, which makes hits and hitters easy to find. High behind a baseline also works.
+
 ## 📊 Outputs
 
 Default output directory: `outputs/<video_name>/`.
@@ -337,6 +353,7 @@ badminton_analysis/
 ├── court/           # Court annotation and coordinate mapping
 ├── data/            # JSON / JSONL output
 ├── detection/       # Shuttlecock detection and pose detection
+├── live/            # Phone camera capture: record and decode on this computer
 ├── media/           # Video/audio processing
 ├── tracking/        # Player tracking
 └── visualization/   # Video overlays, statistics charts, and position plots
