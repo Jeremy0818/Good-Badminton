@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
+import numpy as np
+
 from badminton_analysis.live.capture import (CaptureApp, CaptureSession, StreamDecoder, ensure_certificate,
                                              make_handler)
 
@@ -113,6 +115,23 @@ class CaptureServerTests(unittest.TestCase):
         self.assertEqual(status["size"], (320, 240))
         self.assertIsNotNone(self.app.preview)
         self.assertEqual(self.app.recordings()[0]["id"], session)
+
+    def test_court_is_marked_on_this_computer_and_kept(self):
+        phone, local = self.serve(phone=True), self.serve(phone=False)
+        with self.assertRaises(urllib.error.HTTPError) as caught:   # no picture to mark it on yet
+            self.post(local + "/api/court/suggest", b"")
+        self.assertEqual(caught.exception.code, 404)
+        self.app.frame = np.full((240, 320, 3), 90, np.uint8)
+        self.assertEqual(self.post(local + "/api/court/suggest", b"")["size"], [320, 240])
+        corners = [[100, 80], [220, 80], [260, 200], [60, 200]]
+        with self.assertRaises(urllib.error.HTTPError) as caught:   # not from the phone
+            self.post(phone + "/api/court", json.dumps({"corners": corners}).encode(), key="secret")
+        self.assertEqual(caught.exception.code, 404)
+        self.assertEqual(self.post(local + "/api/court", json.dumps({"corners": corners}).encode())["court"]["corners"],
+                         corners)
+        with open(os.path.join(self.out, "court.json"), encoding="utf-8") as file:
+            self.assertEqual(json.load(file)["corners"], corners)
+        self.assertEqual(self.app.status()["court"]["corners"], corners)
 
     def test_status_page_on_this_computer_needs_no_key(self):
         base = self.serve(phone=False)

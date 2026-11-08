@@ -348,6 +348,14 @@ It prints each call as it is made, writes `live_detections.jsonl` and `live_line
 
 A call waits until the shuttle has been followed for 2.5 s after its last flight, so it comes about 3 s after the landing. On four ShuttleSet matches the live calls were the same as those of the full analysis for all 280 rallies. Two came more than 4 s after the landing: in both the shuttle was lost, and it was flying again straight after.
 
+With the phone: once it is in place, press **Mark the court** on this computer's page. It suggests the court's corners; drag the four dots onto them until the drawn lines sit on the court's lines. From then on the page lists each rally's call as it is made. To try this without a phone, send a saved video in as if a phone were filming it:
+
+```bash
+python -m badminton_analysis.live.capture --replay videos/<video>.mp4 --start 638 --seconds 60
+```
+
+Not fast enough yet: on an Apple M3 Pro a frame showing the court takes about 32 ms to track, nearly all of the 33 ms a frame lasts at 30 fps. A broadcast catches up during replays and close-ups, but a phone shows the court all the time, so tracking can fall a few seconds behind and drop frames.
+
 ## 📊 Outputs
 
 Default output directory: `outputs/<video_name>/`.

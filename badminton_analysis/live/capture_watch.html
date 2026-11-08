@@ -26,8 +26,21 @@
   @media (max-width: 720px) { #live { grid-template-columns: 1fr; } }
   .frame { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
   .frame span { position: absolute; inset: 0; display: grid; place-items: center; color: #9aa0a6; font-size: 14px; }
-  #picture { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #picture, #court-picture, .frame svg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
   #picture:not([src]) { display: none; }
+  .frame svg { overflow: visible; touch-action: none; }
+  .lines { fill: none; stroke: #ffd60a; stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .net { fill: none; stroke: #ffd60a; stroke-width: 4; vector-effect: non-scaling-stroke; }
+  .handle { fill: rgba(229, 72, 77, 0.35); stroke: #fff; stroke-width: 2; vector-effect: non-scaling-stroke; cursor: grab; }
+  .label { fill: #fff; font-weight: 700; paint-order: stroke; stroke: #000; stroke-width: 3px; pointer-events: none; }
+  #mark-frame { margin: 10px 0; }
+  .buttons { display: flex; gap: 8px; margin-top: 10px; }
+  .buttons button { font-size: 14px; padding: 5px 12px; }
+  .buttons button:disabled { opacity: 0.5; cursor: default; }
+  #calls { margin: 0; padding: 0; list-style: none; }
+  #calls li { padding: 6px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  b.in { color: var(--green); }
+  b.out { color: var(--red); }
   #state { font-weight: 600; }
   #state.rec { color: var(--red); }
   dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0 0; font-size: 14px; }
@@ -51,12 +64,32 @@
       To try without a phone: <a href="/camera">this computer's camera</a> or <a href="/camera?test=1">test pattern</a>.</p>
   </section>
   <section id="live">
-    <div class="frame"><span>No video yet</span><img id="picture" alt="Latest picture received from the phone"></div>
+    <div class="frame"><span>No video yet</span><img id="picture" alt="Latest picture received from the phone"><svg id="live-svg"></svg></div>
     <div>
       <div id="state">Waiting for the phone</div>
       <dl id="stats"></dl>
       <div id="errors"></div>
     </div>
+  </section>
+  <section>
+    <h2>Court</h2>
+    <p id="court-state" class="muted"></p>
+    <div id="marking" hidden>
+      <p class="muted">Drag the four dots onto the outer corners of the court: 1 and 2 at the two ends of one baseline,
+        3 and 4 at the other baseline, 3 beside 2. The yellow lines should then sit on the court's lines.</p>
+      <div class="frame" id="mark-frame"><img id="court-picture" alt="Picture to mark the court on"><svg id="mark-svg"></svg></div>
+    </div>
+    <div class="buttons">
+      <button id="mark" disabled>Mark the court</button>
+      <button id="use" hidden>Use this court</button>
+      <button id="again" hidden>New picture</button>
+      <button id="cancel" hidden>Cancel</button>
+    </div>
+  </section>
+  <section>
+    <h2>Line calls</h2>
+    <p id="no-calls" class="muted">Once the court is marked, each rally's call appears here about 3 s after the shuttle lands.</p>
+    <ol id="calls"></ol>
   </section>
   <section>
     <h2>Recordings</h2>
@@ -94,13 +127,36 @@ function render(status) {
     ['Received', `${mb(session.bytes)} in ${session.pieces} pieces` + (session.gaps ? ` · ${session.gaps} missing` : '')],
     ['Decoded', `${session.frames} frames (${clock(session.decoded_seconds)})` + (session.size ? ` · ${session.size[0]}×${session.size[1]}` : '')],
     ['Behind live', status.recording ? `${session.delay} s` : '–'],
+    ['Tracking', session.tracking ? `${session.tracking.court_frames} court frames`
+      + (session.tracking.behind >= 0.5 ? ` · ${session.tracking.behind} s behind` : '')
+      + (session.tracking.dropped ? ` · ${session.tracking.dropped} frames dropped` : '') : 'once the court is marked'],
     ['Saved', session.saved_path || (session.stopped ? 'saving…' : '–')],
   ] : [];
   $('stats').replaceChildren(...rows.flatMap(([name, value]) => [
     Object.assign(document.createElement('dt'), {textContent: name}),
     Object.assign(document.createElement('dd'), {textContent: value}),
   ]));
-  $('errors').textContent = session ? [...session.decoder_errors, session.error || ''].join('\n').trim() : '';
+  $('errors').textContent = session ? [...session.decoder_errors, session.error || '',
+                                       (session.tracking && session.tracking.error) || ''].join('\n').trim() : '';
+  const calls = session ? session.calls : [];
+  $('no-calls').hidden = calls.length > 0;
+  $('calls').replaceChildren(...calls.slice().reverse().map(call => {
+    const margin = Math.abs(call.margin_m);
+    const distance = margin < 1 ? `${Math.round(margin * 100)} cm` : `${margin.toFixed(2)} m`;
+    const item = document.createElement('li');
+    item.append(`Rally ${call.rally} · `, Object.assign(document.createElement('b'), {textContent: call.call.toUpperCase(), className: call.call}),
+                ` · ${distance} ${call.call === 'in' ? 'inside' : 'outside'} the line · landed at ${clock(call.landing_sec)}`);
+    return item;
+  }));
+  court = status.court;
+  $('mark').disabled = !session;
+  if ($('marking').hidden) {
+    $('court-state').textContent = court ? 'Court marked. Mark it again if the phone moves.'
+      : 'Once the phone is in place, mark the court so this computer can follow the shuttle and call the lines.';
+    $('mark').textContent = court ? 'Mark again' : 'Mark the court';
+  }
+  if (court) drawCourt($('live-svg'), court.size, court.corners, false);
+  else $('live-svg').replaceChildren();
   $('list').replaceChildren(...status.recordings.map(item => {
     const row = document.createElement('tr');
     const live = status.recording && session && item.id === session.id;
@@ -122,6 +178,124 @@ async function refresh() {
   setTimeout(refresh, live ? 500 : 1500);
 }
 $('picture').onerror = () => $('picture').removeAttribute('src');
+
+// Court lines in meters, from the corner of a baseline: doubles 6.1 x 13.4 m.
+const COURT = [[0, 0], [6.1, 0], [6.1, 13.4], [0, 13.4]];
+const LINES = [[[0, 0], [6.1, 0]], [[6.1, 0], [6.1, 13.4]], [[6.1, 13.4], [0, 13.4]], [[0, 13.4], [0, 0]],
+  [[0.46, 0], [0.46, 13.4]], [[5.64, 0], [5.64, 13.4]], [[0, 0.76], [6.1, 0.76]], [[0, 12.64], [6.1, 12.64]],
+  [[0, 4.72], [6.1, 4.72]], [[0, 8.68], [6.1, 8.68]], [[3.05, 0], [3.05, 4.72]], [[3.05, 8.68], [3.05, 13.4]]];
+let court = null;
+let marking = null;   // {size, corners} while the court is being marked
+
+function solve(A, b) {   // Gaussian elimination with partial pivoting
+  const n = b.length;
+  for (let i = 0; i < n; i++) {
+    let p = i;
+    for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+    [A[i], A[p], b[i], b[p]] = [A[p], A[i], b[p], b[i]];
+    for (let r = i + 1; r < n; r++) {
+      const f = A[r][i] / A[i][i];
+      for (let c = i; c < n; c++) A[r][c] -= f * A[i][c];
+      b[r] -= f * b[i];
+    }
+  }
+  const x = Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let c = i + 1; c < n; c++) s -= A[i][c] * x[c];
+    x[i] = s / A[i][i];
+  }
+  return x;
+}
+
+function courtToPicture(corners) {   // the homography that puts COURT on the corners
+  const A = [], b = [];
+  COURT.forEach(([X, Y], i) => {
+    const [x, y] = corners[i];
+    A.push([X, Y, 1, 0, 0, 0, -x * X, -x * Y]); b.push(x);
+    A.push([0, 0, 0, X, Y, 1, -y * X, -y * Y]); b.push(y);
+  });
+  const h = solve(A, b);
+  return ([X, Y]) => {
+    const w = h[6] * X + h[7] * Y + 1;
+    return [(h[0] * X + h[1] * Y + h[2]) / w, (h[3] * X + h[4] * Y + h[5]) / w];
+  };
+}
+
+function svgElement(name, attributes, text) {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+  Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
+  if (text) element.textContent = text;
+  return element;
+}
+
+function drawCourt(svg, size, corners, handles) {
+  svg.setAttribute('viewBox', `0 0 ${size[0]} ${size[1]}`);
+  const map = courtToPicture(corners);
+  const path = segments => segments.map(([a, b]) => `M${map(a)}L${map(b)}`).join('');
+  const parts = [svgElement('path', {class: 'lines', d: path(LINES)}),
+                 svgElement('path', {class: 'net', d: path([[[-0.3, 6.7], [6.4, 6.7]]])})];
+  if (handles) {
+    const r = size[0] / 70;
+    corners.forEach(([x, y], i) => parts.push(
+      svgElement('circle', {class: 'handle', cx: x, cy: y, r, 'data-i': i}),
+      svgElement('text', {class: 'label', x: x + r * 1.2, y: y - r * 1.2, 'font-size': r * 2}, String(i + 1))));
+  }
+  svg.replaceChildren(...parts);
+}
+
+function showMarking(on) {
+  $('marking').hidden = !on;
+  $('use').hidden = $('again').hidden = $('cancel').hidden = !on;
+  $('mark').hidden = on;
+}
+
+async function holdPicture() {
+  const reply = await (await fetch('api/court/suggest', {method: 'POST'})).json();
+  if (reply.error) { $('court-state').textContent = reply.error; return; }
+  const [w, h] = reply.size;
+  marking = {size: reply.size,
+             corners: reply.corners || [[w * 0.35, h * 0.35], [w * 0.65, h * 0.35], [w * 0.8, h * 0.85], [w * 0.2, h * 0.85]]};
+  $('court-picture').src = 'court.jpg?t=' + Date.now();
+  $('mark-frame').style.aspectRatio = `${w} / ${h}`;
+  drawCourt($('mark-svg'), marking.size, marking.corners, true);
+  $('court-state').textContent = reply.corners ? 'Found a court: check that the dots sit on its corners.'
+    : 'Could not find the court by itself: drag the dots onto its corners.';
+  showMarking(true);
+}
+
+$('mark-svg').addEventListener('pointerdown', event => {
+  const i = event.target.dataset.i;
+  if (i === undefined) return;
+  const svg = $('mark-svg');
+  svg.setPointerCapture(event.pointerId);
+  const move = moved => {
+    const point = new DOMPoint(moved.clientX, moved.clientY).matrixTransform(svg.getScreenCTM().inverse());
+    marking.corners[i] = [Math.min(Math.max(point.x, 0), marking.size[0] - 1), Math.min(Math.max(point.y, 0), marking.size[1] - 1)];
+    drawCourt(svg, marking.size, marking.corners, true);
+  };
+  const up = () => { svg.removeEventListener('pointermove', move); svg.removeEventListener('pointerup', up); };
+  svg.addEventListener('pointermove', move);
+  svg.addEventListener('pointerup', up);
+});
+$('mark').onclick = holdPicture;
+$('again').onclick = holdPicture;
+$('cancel').onclick = () => { marking = null; showMarking(false); };
+$('use').onclick = async () => {
+  const corners = marking.corners.map(point => point.map(Math.round));
+  const reply = await (await fetch('api/court', {method: 'POST', body: JSON.stringify({corners})})).json();
+  if (reply.error) { $('court-state').textContent = reply.error; return; }
+  marking = null;
+  showMarking(false);
+  refreshCourt(reply.court);
+};
+
+function refreshCourt(marked) {
+  court = marked;
+  drawCourt($('live-svg'), court.size, court.corners, false);
+  $('court-state').textContent = 'Court marked. Mark it again if the phone moves.';
+  $('mark').textContent = 'Mark again';
+}
 refresh();
 </script>
 </body>
