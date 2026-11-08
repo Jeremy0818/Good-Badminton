@@ -352,7 +352,9 @@ python -m badminton_analysis.live.tracker outputs/<视频名> --start 600 --seco
 python -m badminton_analysis.live.capture --replay videos/<视频>.mp4 --start 638 --seconds 60
 ```
 
-目前速度还不够：在 Apple M3 Pro 上，追踪一帧有球场的画面约需 32 ms，几乎用掉 30 fps 下每帧的全部 33 ms。转播画面在回放和特写时可以追上，但手机一直拍着球场，追踪可能落后几秒并丢帧。
+标记球场后请保持手机不动：画面移动几个像素，远端底线附近的落点就会偏移 10 cm 以上。画面移动 2 像素或以上时，页面会提示，需要重新标记球场。
+
+目前对手机来说还不够快：在 Apple M3 Pro 上，逐帧追踪 1080p 视频每帧仍需约 32 ms，几乎用掉 30 fps 下每帧的全部 33 ms，追踪可能落后几秒。转播画面在回放和特写时可以追上。用 `python -m badminton_analysis.live.tracker ... --every-frame` 可以测量这个负载。
 
 ## 📊 输出结果
 

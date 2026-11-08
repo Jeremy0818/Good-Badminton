@@ -43,6 +43,9 @@ PREVIEW_EVERY = 0.5       # seconds between preview images
 # Frames are decoded at most this tall for the preview, marking the court and live tracking; the recording
 # keeps its full size. TrackNet sees 512x288 anyway, and at 1080p the tracker kept up only just.
 DECODE_HEIGHT = 720
+# A shift of the picture this many pixels at DECODE_HEIGHT since the court was marked moves a landing by about
+# 12 cm near the far baseline (Marin v Yigit's broadcast view), so the page asks for the court to be marked again.
+MOVED_PX = 2.0
 
 
 def lan_address():
@@ -294,11 +297,26 @@ class LiveCalls(threading.Thread):
         metadata = {"video": {"fps": session.fps, "width": court["size"][0], "height": court["size"][1]},
                     "court": court}
         self.session = session
-        self.tracker = LiveTracker(metadata, tracknet, pose)
+        self.tracker = LiveTracker(metadata, tracknet, pose, court_every=0.2)
         self.caller = LiveLineCaller(metadata)
         self.frames = queue.Queue(maxsize=round(backlog * session.fps))
         self.dropped = 0
         self.error = None
+        # How far the picture has shifted since the court was marked, measured every 2 s against the marked
+        # picture by phase correlation, which the players running about hardly disturb.
+        self.reference = self._small(cv2.imread(court["template_path"], cv2.IMREAD_GRAYSCALE))
+        self.hanning = cv2.createHanningWindow(self.reference.shape[::-1], cv2.CV_32F)
+        self.shift_every = round(2 * session.fps)
+        self.shift = 0.0
+
+    @staticmethod
+    def _small(gray):
+        return cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    def _measure_shift(self, image):
+        (dx, dy), _ = cv2.phaseCorrelate(self.reference, self._small(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)),
+                                         self.hanning)
+        self.shift = 2 * float(np.hypot(dx, dy))
 
     def add(self, index, yuv):
         try:
@@ -311,7 +329,8 @@ class LiveCalls(threading.Thread):
 
     def state(self):
         return {"court_frames": self.tracker.court_frames, "behind": round(self.frames.qsize() / self.session.fps, 1),
-                "dropped": self.dropped, "error": self.error}
+                "dropped": self.dropped, "error": self.error, "shift_px": round(self.shift, 1),
+                "moved": self.shift >= MOVED_PX}
 
     def run(self):
         fps, session = self.session.fps, self.session
@@ -323,8 +342,11 @@ class LiveCalls(threading.Thread):
                         records = self.tracker.finish()
                         calls = self.caller.update(records, self.tracker.done_through / fps) + self.caller.finish()
                     else:
-                        records = self.tracker.add_frame(item[0], to_bgr(item[1]))
+                        image = to_bgr(item[1])
+                        records = self.tracker.add_frame(item[0], image)
                         calls = self.caller.update(records, self.tracker.done_through / fps)
+                        if item[0] % self.shift_every == 0 and self.tracker.shows_court:
+                            self._measure_shift(image)
                     for record in records:
                         writer.write(record)
                     for call in calls:

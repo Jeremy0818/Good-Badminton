@@ -354,7 +354,9 @@ With the phone: once it is in place, press **Mark the court** on this computer's
 python -m badminton_analysis.live.capture --replay videos/<video>.mp4 --start 638 --seconds 60
 ```
 
-Not fast enough yet: on an Apple M3 Pro a frame showing the court takes about 32 ms to track, nearly all of the 33 ms a frame lasts at 30 fps. A broadcast catches up during replays and close-ups, but a phone shows the court all the time, so tracking can fall a few seconds behind and drop frames.
+Keep the phone still once the court is marked: a shift of a few pixels moves landings near the far baseline by 10 cm or more. If the picture moves 2 px or more, the page says so; mark the court again.
+
+Not fast enough yet for a phone: on an Apple M3 Pro, tracking every frame of a 1080p video still takes about 32 ms of the 33 ms a frame lasts at 30 fps, so tracking can fall several seconds behind. A broadcast catches up during replays and close-ups. `python -m badminton_analysis.live.tracker ... --every-frame` measures this load.
 
 ## 📊 Outputs
 

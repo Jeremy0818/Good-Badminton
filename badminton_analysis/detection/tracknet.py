@@ -146,6 +146,10 @@ class TrackNetTracker:
         self.device = device or pick_device()
         self.model = TrackNet().to(self.device).eval()
         self.model.load_state_dict(checkpoint["model"])
+        # Half precision on the GPU: on an M3 Pro a window takes 57 ms instead of 74, with the same shuttle
+        # positions on 112 broadcast frames and 2 minutes of live tracking.
+        self.dtype = torch.float32 if self.device == "cpu" else torch.float16
+        self.model.to(self.dtype)
         self.background = None
 
     @staticmethod
@@ -170,7 +174,7 @@ class TrackNetTracker:
         """The network's heatmaps for a window of 8 prepared frames."""
         stack = np.concatenate([self.background] + window, axis=0)
         with torch.no_grad():
-            return self.model(torch.from_numpy(stack)[None].to(self.device)).cpu().numpy()[0]
+            return self.model(torch.from_numpy(stack)[None].to(self.device, self.dtype)).float().cpu().numpy()[0]
 
     def track_run(self, frames_bgr):
         """Yield the shuttle [x, y] in source pixels, or None where it is not seen, for each frame of an

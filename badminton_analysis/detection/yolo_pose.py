@@ -21,6 +21,10 @@ class YOLOPoseProcessor:
 
         print(f"Initializing YOLO pose model (model: {self.model_path}, device: {self.device})")
         self.model = YOLO(self.model_path)
+        # Importing ultralytics leaves OpenCV with one thread, which doubled the time the live tracker took to
+        # shrink frames for TrackNet. Give it all the cores back.
+        import cv2
+        cv2.setNumThreads(-1)
 
     def process_frame(self, frame):
         result = self.model(frame, conf=self.conf, device=self.device, verbose=False)[0]

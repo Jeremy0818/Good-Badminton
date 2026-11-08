@@ -39,6 +39,7 @@
   .buttons button:disabled { opacity: 0.5; cursor: default; }
   #calls { margin: 0; padding: 0; list-style: none; }
   #calls li { padding: 6px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .warning { color: var(--red); font-weight: 600; }
   b.in { color: var(--green); }
   b.out { color: var(--red); }
   #state { font-weight: 600; }
@@ -150,9 +151,13 @@ function render(status) {
   }));
   court = status.court;
   $('mark').disabled = !session;
+  const moved = session && session.tracking && session.tracking.moved;
   if ($('marking').hidden) {
-    $('court-state').textContent = court ? 'Court marked. Mark it again if the phone moves.'
+    $('court-state').textContent = moved
+      ? `The picture has moved ${session.tracking.shift_px} px since the court was marked, so calls may be off: mark it again.`
+      : court ? 'Court marked. Mark it again if the phone moves.'
       : 'Once the phone is in place, mark the court so this computer can follow the shuttle and call the lines.';
+    $('court-state').classList.toggle('warning', Boolean(moved));
     $('mark').textContent = court ? 'Mark again' : 'Mark the court';
   }
   if (court) drawCourt($('live-svg'), court.size, court.corners, false);

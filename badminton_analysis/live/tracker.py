@@ -53,7 +53,7 @@ class LiveTracker:
     """
 
     def __init__(self, metadata, tracknet, pose=None, pose_every=0.2, background_every=0.2, first_background=10,
-                 background_frames=50, sample_every=2.0, refresh_every=60.0, max_samples=150):
+                 background_frames=50, sample_every=2.0, refresh_every=60.0, max_samples=150, court_every=0.0):
         video, court = metadata["video"], metadata["court"]
         self.fps = float(video["fps"])
         self.tracknet = tracknet
@@ -69,6 +69,10 @@ class LiveTracker:
             self.template = cv2.resize(template, self.court_size, interpolation=cv2.INTER_AREA)
         self.players = PlayerTracker(corners, threshold=court["mid_height"], detection_writer=self, fps=self.fps)
         self.pose_every = max(1, round(pose_every * self.fps))
+        # A broadcast can cut away on any frame. A phone on a stand keeps its view, so checking a few times a
+        # second is enough to notice it being moved.
+        self.court_every = max(1, round(court_every * self.fps))
+        self.court_checked, self.shows_court = None, True
         self.background_every = max(1, round(background_every * self.fps))
         self.first_background = first_background
         self.background_frames = background_frames
@@ -93,9 +97,10 @@ class LiveTracker:
         """Process frame number `frame`, counted from 1. Returns the records finished so far, in order."""
         self.frame = frame
         started = time.perf_counter()
-        shows_court = self.template is None or self._shows_court(image)
+        if self.template is not None and (self.court_checked is None or frame - self.court_checked >= self.court_every):
+            self.shows_court, self.court_checked = self._shows_court(image), frame
         self._time("court check", started)
-        if not shows_court:
+        if not self.shows_court:
             self._end_run()
             return self._take()
         self.court_frames += 1
@@ -205,10 +210,14 @@ def main():
     parser.add_argument("--pose-model", default="weights/yolo11n-pose.pt", help="YOLO pose model, as in main.py")
     parser.add_argument("--weights", default=DEFAULT_WEIGHTS)
     parser.add_argument("--video", default=None, help="Video file, if it has moved since the analysis")
+    parser.add_argument("--every-frame", action="store_true",
+                        help="Track every frame, as for a phone that always shows the court: the load to keep up with")
     args = parser.parse_args()
 
     with open(os.path.join(args.output_dir, "metadata.json"), "r", encoding="utf-8") as file:
         metadata = json.load(file)
+    if args.every_frame:
+        metadata["court"].pop("template_path", None)
     fps = float(metadata["video"]["fps"])
     pose = None
     if args.pose_every > 0:
