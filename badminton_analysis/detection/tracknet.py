@@ -159,7 +159,11 @@ class TrackNetTracker:
 
     def set_background(self, frames_bgr):
         """Median of frames spread over the video: the court without the moving shuttle."""
-        median = np.median(np.array([self.prepare(frame) for frame in frames_bgr]), axis=0).astype(np.uint8)
+        self.set_background_prepared([self.prepare(frame) for frame in frames_bgr])
+
+    def set_background_prepared(self, frames):
+        """set_background for frames already passed through prepare."""
+        median = np.median(np.array(frames), axis=0).astype(np.uint8)
         self.background = median.astype(np.float32) / 255.0
 
     def _heatmaps(self, window):
@@ -171,29 +175,48 @@ class TrackNetTracker:
     def track_run(self, frames_bgr):
         """Yield the shuttle [x, y] in source pixels, or None where it is not seen, for each frame of an
         unbroken run of frames. Takes any iterable, so a video can be read as it goes."""
-        frames_bgr = iter(frames_bgr)
-        pending, heat, weight = [], [], []   # frames not finished yet, oldest first
-        ended = False
-        while True:
-            while not ended and len(pending) < SEQ:
-                image = next(frames_bgr, None)
-                if image is None:
-                    ended = True
-                    break
-                scale = (image.shape[1] / WIDTH, image.shape[0] / HEIGHT)
-                pending.append(self.prepare(image).astype(np.float32) / 255.0)
-                heat.append(np.zeros((HEIGHT, WIDTH), np.float32))
-                weight.append(0.0)
-            if not pending:
-                return
-            maps = self._heatmaps(pending + [pending[-1]] * (SEQ - len(pending)))   # repeat the last frame at the end
-            for i in range(len(pending)):
-                heat[i] += WINDOW_WEIGHTS[i] * maps[i]
-                weight[i] += WINDOW_WEIGHTS[i]
-            # The next window starts STRIDE frames on, so no other window will see the first STRIDE frames.
-            for _ in range(min(STRIDE, len(pending))):
-                pending.pop(0)
-                yield heatmap_peak(heat.pop(0) / weight.pop(0), *scale)
+        run = TrackNetRun(self)
+        for image in frames_bgr:
+            yield from run.push(image)
+        yield from run.close()
+
+
+class TrackNetRun:
+    """One unbroken run of frames, fed to TrackNet as they arrive. A frame is finished once no later
+    window will see it, 4 to 7 frames after it arrives."""
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.pending, self.heat, self.weight = [], [], []   # frames not finished yet, oldest first
+        self.scale = None
+
+    def push(self, image_bgr):
+        """Add the next frame. Returns the shuttle [x, y] or None for each frame this finishes, oldest first."""
+        self.scale = (image_bgr.shape[1] / WIDTH, image_bgr.shape[0] / HEIGHT)
+        self.pending.append(self.tracker.prepare(image_bgr).astype(np.float32) / 255.0)
+        self.heat.append(np.zeros((HEIGHT, WIDTH), np.float32))
+        self.weight.append(0.0)
+        return self._window() if len(self.pending) == SEQ else []
+
+    def close(self):
+        """Finish the frames left at the end of the run."""
+        points = []
+        while self.pending:
+            points += self._window()
+        return points
+
+    def _window(self):
+        window = self.pending + [self.pending[-1]] * (SEQ - len(self.pending))   # repeat the last frame at the end
+        maps = self.tracker._heatmaps(window)
+        for i in range(len(self.pending)):
+            self.heat[i] += WINDOW_WEIGHTS[i] * maps[i]
+            self.weight[i] += WINDOW_WEIGHTS[i]
+        # The next window starts STRIDE frames on, so no other window will see the first STRIDE frames.
+        points = []
+        for _ in range(min(STRIDE, len(self.pending))):
+            self.pending.pop(0)
+            points.append(heatmap_peak(self.heat.pop(0) / self.weight.pop(0), *self.scale))
+        return points
 
 
 def frame_runs(frames):

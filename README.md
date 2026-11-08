@@ -334,6 +334,16 @@ python -m badminton_analysis.live.capture
 
 机位建议：放在场边与球网对齐的位置，尽量架高，让整个球场入画（通常需要 0.5× 镜头，前提是手机浏览器提供该镜头）。从这个角度看，每次击球都会让羽毛球在画面中的左右方向反转，便于判断击球及击球者。架高放在底线后方也可以。
 
+### 边拍边追踪（实验功能）
+
+实时复核的第一步：画面一到就追踪羽毛球和球员，羽毛球用 TrackNet，球员姿态每秒取几次。在接入手机之前，可以按原速重放已分析过的视频来试用：
+
+```bash
+python -m badminton_analysis.live.tracker outputs/<视频名> --start 600 --seconds 120
+```
+
+结果写入 `detections.jsonl` 旁边的 `live_detections.jsonl`，并报告每一步的耗时。在 Apple M3 Pro 上，一场转播比赛的两分钟片段每帧耗时 15 ms（30 fps 下每帧可用 33 ms），每帧的记录在该帧之后 0.3 秒即可得到，落点判定与完整分析的结果相同。
+
 ## 📊 输出结果
 
 默认输出到 `outputs/<视频文件名>/`：
