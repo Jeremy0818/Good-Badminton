@@ -278,6 +278,14 @@ python -m badminton_analysis.analysis.line_calls outputs/<视频名> --match-typ
 
 单机位对清晰的落点判定可靠；距边线仅几厘米的球，或 25-30 fps 下羽毛球模糊的落点，仍需人工复核。
 
+想要更准的落点，可以再用 [TrackNetV3](https://github.com/qaz812345/TrackNetV3) 追踪一遍羽毛球：它同时看 8 帧，比单帧检测器更能跟住地面附近又小又模糊的球。下载 TrackNetV3 的[模型权重](https://drive.google.com/file/d/1CfzE87a0f6LhBp0kniSl1-89zaLCZ8cA/view?usp=sharing)，解压后把 `TrackNet_best.pt` 放到 `weights/`，然后运行：
+
+```bash
+python -m badminton_analysis.detection.tracknet outputs/<视频名>
+```
+
+结果保存为 `detections.jsonl` 旁边的 `tracknet.csv`，之后落点判定、计分和两种复核都会使用其中的羽毛球位置（删除该文件即恢复使用检测器的位置）。在 Apple M3 Pro 上每帧 1080p 视频约需 22 ms，比视频播放更快。在四场转播测试比赛上，判对的落点从 142 个中的 105 个提高到 146 个中的 118 个，与标注落点的距离中位数从 42 cm 降到 27 cm。
+
 ### 计分与复核
 
 在转播测试比赛上，自动计分约能判对 70% 的回合胜方，因此比分通过快速复核生成：逐个回放每回合结尾并标出自动判定，按一个键确认或更正。
@@ -370,9 +378,11 @@ webui/
 
 感谢 [yastrebksv/TrackNet](https://github.com/yastrebksv/TrackNet) 项目整理并公开羽毛球数据集，为本项目的羽毛球检测与轨迹分析提供了重要参考。
 
+感谢 [qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3) 提供用于提高落点精度的羽毛球追踪模型和权重。
+
 ## 📄 许可证
 
-本项目代码和 `weights/yolo11s-ball.pt` 使用 Apache License 2.0。随 Release 提供的 RTMPose / RTMO / YOLOX ONNX 权重来自 OpenMMLab / RTMPose 生态，按其上游 Apache License 2.0 授权使用，并保留原始归属。
+本项目代码和 `weights/yolo11s-ball.pt` 使用 Apache License 2.0。随 Release 提供的 RTMPose / RTMO / YOLOX ONNX 权重来自 OpenMMLab / RTMPose 生态，按其上游 Apache License 2.0 授权使用，并保留原始归属。需另行下载的 TrackNetV3 权重，以及 `badminton_analysis/detection/tracknet.py` 中参照其代码实现的网络，使用 TrackNetV3 的 MIT 许可证。
 
 ## Star History
 

@@ -1,11 +1,16 @@
+import json
+import os
+import tempfile
 import unittest
 
 import numpy as np
 
 from badminton_analysis.analysis.line_calls import (
+    TRACKNET_CSV,
     LineCallConfig,
     call_landing,
     compute_line_calls,
+    load_run,
 )
 from badminton_analysis.court.mapper import CourtMapper
 from badminton_analysis.court.reference import BADMINTON_SINGLES_MARGIN
@@ -217,6 +222,25 @@ class ComputeLineCallsTests(unittest.TestCase):
         for call in calls:
             self.assertEqual((call.call, call.landing_side), ("in", "upper"))
             self.assertAlmostEqual(call.landing_court[1], 2.0, delta=0.3)
+
+
+class LoadRunTests(unittest.TestCase):
+    def test_tracknet_positions_replace_the_detectors_when_saved_next_to_the_detections(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "metadata.json"), "w", encoding="utf-8") as file:
+                json.dump(METADATA, file)
+            with open(os.path.join(folder, "detections.jsonl"), "w", encoding="utf-8") as file:
+                for frame, shuttle in ((1, [10.0, 20.0]), (2, None), (3, [30.0, 40.0])):
+                    file.write(json.dumps({"frame": frame, "shuttlecock": {"image": shuttle}}) + "\n")
+
+            def shuttles(**options):
+                return [record["shuttlecock"]["image"] for record in load_run(folder, **options)[1]]
+
+            self.assertEqual(shuttles(), [[10.0, 20.0], None, [30.0, 40.0]])
+            with open(os.path.join(folder, TRACKNET_CSV), "w", encoding="utf-8") as file:
+                file.write("frame,x,y\n2,15,25\n3,31,41\n")
+            self.assertEqual(shuttles(), [None, [15.0, 25.0], [31.0, 41.0]])
+            self.assertEqual(shuttles(use_tracknet=False), [[10.0, 20.0], None, [30.0, 40.0]])
 
 
 if __name__ == "__main__":

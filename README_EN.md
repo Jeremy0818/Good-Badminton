@@ -280,6 +280,14 @@ python -m badminton_analysis.analysis.line_calls outputs/<video_name> --match-ty
 
 Single-camera calls are reliable for clear landings. Shots within a few cm of a line, or landings at 25-30 fps where the shuttle is blurred, still need a human check.
 
+For more accurate landings, track the shuttle a second time with [TrackNetV3](https://github.com/qaz812345/TrackNetV3), which looks at 8 frames at once and keeps hold of the small, blurred shuttle near the floor better than the single-frame detector. Download TrackNetV3's [checkpoints](https://drive.google.com/file/d/1CfzE87a0f6LhBp0kniSl1-89zaLCZ8cA/view?usp=sharing), unzip them and put `TrackNet_best.pt` in `weights/`, then run:
+
+```bash
+python -m badminton_analysis.detection.tracknet outputs/<video_name>
+```
+
+It saves `tracknet.csv` next to `detections.jsonl`, and line calls, scoring and both reviews use its shuttle positions from then on (delete the file to go back to the detector's). On an Apple M3 Pro it takes about 22 ms per analysed frame of 1080p video, faster than the video plays. On four broadcast test matches it raised correct line calls from 105 of 142 to 118 of 146 and cut the median distance from the labelled landing spot from 42 to 27 cm.
+
 ### Scoring with Review
 
 Automatic scoring gets roughly 70% of rally winners right on broadcast test matches, so the score is built with a quick review: each rally's ending is replayed with the automatic call drawn on it, and one key confirms or corrects it.
@@ -372,9 +380,11 @@ Thanks to [Ultralytics](https://github.com/ultralytics/ultralytics) for the YOLO
 
 Thanks to [yastrebksv/TrackNet](https://github.com/yastrebksv/TrackNet) for organizing and releasing badminton datasets, which provided important references for shuttlecock detection and trajectory analysis in this project.
 
+Thanks to [qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3) for the shuttle-tracking model and checkpoints used for more accurate landings.
+
 ## 📄 License
 
-Project code and `weights/yolo11s-ball.pt` are licensed under Apache License 2.0. RTMPose / RTMO / YOLOX ONNX weights provided in Releases come from the OpenMMLab / RTMPose ecosystem, are used under their upstream Apache License 2.0, and retain their original attribution.
+Project code and `weights/yolo11s-ball.pt` are licensed under Apache License 2.0. RTMPose / RTMO / YOLOX ONNX weights provided in Releases come from the OpenMMLab / RTMPose ecosystem, are used under their upstream Apache License 2.0, and retain their original attribution. TrackNetV3's checkpoints, downloaded separately, and the network in `badminton_analysis/detection/tracknet.py`, which follows its code, are under TrackNetV3's MIT License.
 
 ## Star History
 

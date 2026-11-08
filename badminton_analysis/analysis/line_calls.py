@@ -1,9 +1,11 @@
 """Shuttlecock line calls from an existing analysis run.
 
-Reads ``metadata.json`` and ``detections.jsonl`` written by the main pipeline,
-splits the video into rallies from shuttle motion (fixed-camera friendly: no
-camera cuts needed), finds where the last shot of each rally landed and calls
-it in or out against the singles or doubles boundary.
+Reads ``metadata.json`` and ``detections.jsonl`` written by the main pipeline
+(and ``tracknet.csv``, when TrackNet has been run on the video: its shuttle
+positions are used instead of the detector's), splits the video into rallies
+from shuttle motion (fixed-camera friendly: no camera cuts needed), finds where
+the last shot of each rally landed and calls it in or out against the singles
+or doubles boundary.
 
 Run it again on an existing output directory without re-processing the video:
 
@@ -11,6 +13,7 @@ Run it again on an existing output directory without re-processing the video:
 """
 
 import argparse
+import csv
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -27,6 +30,7 @@ from ..court.reference import (
 
 NET_Y = BADMINTON_COURT_LENGTH / 2.0
 SIDE_LABELS = {"upper": "far", "lower": "near"}
+TRACKNET_CSV = "tracknet.csv"   # shuttle positions from detection/tracknet.py, next to detections.jsonl
 
 
 @dataclass
@@ -107,7 +111,13 @@ def call_landing(court_point, match_type):
     return ("in" if margin >= 0 else "out"), round(margin, 3)
 
 
-def load_run(output_dir):
+def load_tracknet_csv(path):
+    """{frame: [x, y]} from tracknet.csv. Frames where TrackNet did not see the shuttle are left out."""
+    with open(path, "r", encoding="utf-8", newline="") as file:
+        return {int(row["frame"]): [float(row["x"]), float(row["y"])] for row in csv.DictReader(file)}
+
+
+def load_run(output_dir, use_tracknet=True):
     with open(os.path.join(output_dir, "metadata.json"), "r", encoding="utf-8") as file:
         metadata = json.load(file)
     # Prefer the file next to metadata.json: the stored path goes stale if the folder is moved.
@@ -120,6 +130,14 @@ def load_run(output_dir):
             line = line.strip()
             if line:
                 records.append(json.loads(line))
+    # TrackNet's shuttle replaces the detector's in every frame. It follows the shuttle down to the floor
+    # more often: on four ShuttleSet matches it got 118 of 146 line calls right against 105 of 142, and
+    # filling its gaps with the detector's positions made the calls worse.
+    tracknet_path = os.path.join(output_dir, TRACKNET_CSV)
+    if use_tracknet and os.path.exists(tracknet_path):
+        points = load_tracknet_csv(tracknet_path)
+        for record in records:
+            record["shuttlecock"] = {"image": points.get(record["frame"])}
     return metadata, records
 
 
