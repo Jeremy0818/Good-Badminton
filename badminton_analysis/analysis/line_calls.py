@@ -43,6 +43,11 @@ class LineCallConfig:
     min_rally_points: int = 6
     settle_window: float = 1.5      # seconds after the last flight sample to look for the landing
     settle_points: int = 3
+    # Error of a landing point, shown as a ring in the review. position_error (screen heights) covers
+    # detection, timing and bounce together: at 0.02, 70% of ShuttleSet's labelled landings fall within
+    # one sigma. Retune it on recordings from your own camera.
+    position_error: float = 0.02
+    bounce_error: float = 0.3       # meters a shuttle seen only after it bounced may have moved
     hand_radius: float = 0.06       # settled shuttle this close to a hand = held, not landed
     close_call_margin: float = 0.15  # meters from a line that counts as a close call
     net_margin: float = 0.3          # meters from the net where the landing side is uncertain
@@ -69,6 +74,7 @@ class RallyCall:
     landing_side: str = None
     call: str = "unknown"
     margin_m: float = None
+    landing_error_m: list = None    # 1-sigma error of the landing point along court x and y, meters
     landing_method: str = None
     confidence: str = "low"
     flags: list = field(default_factory=list)
@@ -255,6 +261,65 @@ def _find_settle(samples, start, stop, end_t, frame_height, config):
     return None
 
 
+def _linked(samples, a, b, config):
+    return samples[b]["t"] - samples[a]["t"] <= config.max_link_gap
+
+
+def _velocity(samples, a, b):
+    return (samples[b]["p"] - samples[a]["p"]) / (samples[b]["t"] - samples[a]["t"])
+
+
+def _find_touchdown(samples, first, last, stop, settle, fps, config):
+    """Where and when the shuttle first touched the floor: (image point, frame, detect frame).
+
+    A shuttle often bounces or skids on for 0.3 m or more after touching down, so where it
+    comes to rest is too deep. The touch-down lies between the last fast sample and the next
+    one: find the moment when the incoming flight, continued at its last speed, meets the
+    slow motion that follows. Without samples on both sides, use the first still sample.
+    The last value is the incoming image velocity (px/s), or None for the first still sample.
+    """
+    after = last + 1
+    if not (first < last and after < stop and _linked(samples, last - 1, last, config)
+            and _linked(samples, last, after, config)):
+        sample = samples[settle[0]]
+        return sample["p"], sample["frame"], sample["detect_frame"], None
+    v_in = _velocity(samples, last - 1, last)
+    v_out = np.zeros(2)
+    if after + 1 < stop and _linked(samples, after, after + 1, config):
+        v_out = _velocity(samples, after, after + 1)
+    gap = samples[after]["t"] - samples[last]["t"]
+    # Next sample = last + v_in * s + v_out * (gap - s); solve for s, the time to touch-down.
+    change = v_in - v_out
+    s = (samples[after]["p"] - samples[last]["p"] - v_out * gap) @ change / max(float(change @ change), 1e-9)
+    s = float(np.clip(s, 0.0, gap))
+    offset = int(round(s * fps))
+    return samples[last]["p"] + v_in * s, samples[last]["frame"] + offset, samples[last]["detect_frame"] + offset, v_in
+
+
+def _court_jacobian(matrix, point):
+    """Meters on the court per pixel at an image point, from the image-to-court homography."""
+    w = matrix @ np.array([point[0], point[1], 1.0])
+    x, y = w[0] / w[2], w[1] / w[2]
+    return np.array([[matrix[0, 0] - x * matrix[2, 0], matrix[0, 1] - x * matrix[2, 1]],
+                     [matrix[1, 0] - y * matrix[2, 0], matrix[1, 1] - y * matrix[2, 1]]]) / w[2]
+
+
+def landing_error(matrix, point, velocity, fps, frame_height, config):
+    """1-sigma error of a landing point along court x and y, in meters.
+
+    Adds up the position error and, for a touch-down placed between two frames, how far the
+    shuttle travels in half a frame. Without a touch-down estimate the point is where the shuttle
+    was first seen still, so it may have bounced on: add bounce_error.
+    """
+    jacobian = _court_jacobian(matrix, point)
+    variance = (config.position_error * frame_height) ** 2 * np.sum(jacobian ** 2, axis=1)
+    if velocity is None:
+        variance += config.bounce_error ** 2
+    else:
+        variance += (jacobian @ velocity / (2 * fps)) ** 2
+    return [round(float(value), 3) for value in np.sqrt(variance)]
+
+
 def compute_line_calls(metadata, records, config=None):
     config = config or LineCallConfig()
     fps = float(metadata["video"]["fps"])
@@ -281,8 +346,8 @@ def compute_line_calls(metadata, records, config=None):
 
         settle = _find_settle(samples, last, next_start, samples[last]["t"], frame_height, config)
         if settle:
-            point = np.median([samples[k]["p"] for k in settle], axis=0)
-            landing_sample = samples[settle[0]]
+            point, landing_frame, landing_detect_frame, velocity = _find_touchdown(
+                samples, first, last, next_start, settle, fps, config)
             rally.landing_method = "settled"
             hand_px = config.hand_radius * frame_height
             for k in settle:
@@ -293,16 +358,18 @@ def compute_line_calls(metadata, records, config=None):
                     break
         else:
             point = samples[last]["p"]
-            landing_sample = samples[last]
+            landing_frame, landing_detect_frame = samples[last]["frame"], samples[last]["detect_frame"]
             rally.landing_method = "last_seen"
             rally.flags.append("shuttle lost before it settled: landing taken from last flight position")
 
         court_point = mapper.image_to_court([float(point[0]), float(point[1])])
-        rally.landing_frame = landing_sample["frame"]
-        rally.landing_detect_frame = landing_sample["detect_frame"]
+        rally.landing_frame = landing_frame
+        rally.landing_detect_frame = landing_detect_frame
         rally.landing_image = [round(float(point[0]), 1), round(float(point[1]), 1)]
         rally.landing_court = [float(court_point[0]), float(court_point[1])]
         rally.landing_side = "upper" if court_point[1] < NET_Y else "lower"
+        if rally.landing_method != "last_seen":  # a lost shuttle's position is a guess, not a measurement
+            rally.landing_error_m = landing_error(mapper.matrix, point, velocity, fps, frame_height, config)
         rally.call, rally.margin_m = call_landing(court_point, config.match_type)
 
         if abs(rally.margin_m) < config.close_call_margin:

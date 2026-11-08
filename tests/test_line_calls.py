@@ -51,7 +51,7 @@ class SyntheticMatch:
         for _ in range(int(seconds * FPS)):
             self._add()
 
-    def rally(self, start_court, landing_court, flight_seconds=1.0, settle_seconds=1.0, held=False):
+    def rally(self, start_court, landing_court, flight_seconds=1.0, settle_seconds=1.0, held=False, skid_to=None):
         start = np.array(self._image(start_court))
         end = np.array(self._image(landing_court))
         steps = int(flight_seconds * FPS)
@@ -60,6 +60,12 @@ class SyntheticMatch:
             point = start + (end - start) * u
             point[1] -= 220 * 4 * u * (1 - u)  # arc: the shuttle rises in the image mid-flight
             self._add(shuttle=[float(point[0]), float(point[1])])
+        if skid_to is not None:  # slides on slowly after touching down, then rests there
+            rest = np.array(self._image(skid_to))
+            for i in range(1, 10):
+                point = end + (rest - end) * i / 9
+                self._add(shuttle=[float(point[0]), float(point[1])])
+            end = rest
         hand = [float(end[0]) + 5, float(end[1]) - 5] if held else None
         for i in range(int(settle_seconds * FPS)):
             jitter = 1.0 if i % 2 else -1.0
@@ -127,6 +133,25 @@ class ComputeLineCallsTests(unittest.TestCase):
         call = self.calls()[0]
         self.assertEqual(call.call, "in")
         self.assertTrue(any("from the net" in flag for flag in call.flags))
+
+    def test_landing_is_where_the_shuttle_touched_down_not_where_it_skidded_to(self):
+        self.match.rally((3.0, 12.0), (3.0, 0.15), skid_to=(3.0, -0.25))  # in by 15 cm, rests 25 cm out
+        self.match.idle(2)
+        call = self.calls()[0]
+        self.assertEqual((call.landing_method, call.call), ("settled", "in"))
+        self.assertAlmostEqual(call.landing_court[1], 0.15, delta=0.08)
+
+    def test_landing_error_is_larger_far_from_the_camera_and_absent_when_lost(self):
+        self.match.rally((3.0, 12.0), (3.0, 1.0))   # far court: fewer pixels per meter
+        self.match.idle(3)
+        self.match.rally((3.0, 2.0), (3.0, 12.4))   # near court
+        self.match.idle(3)
+        self.match.rally((3.0, 12.0), (3.0, 3.0), settle_seconds=0)
+        self.match.idle(2)
+        far, near, lost = self.calls()
+        self.assertEqual(len(far.landing_error_m), 2)
+        self.assertGreater(far.landing_error_m[1], near.landing_error_m[1])
+        self.assertIsNone(lost.landing_error_m)
 
     def test_lost_shuttle_uses_last_position_with_low_confidence(self):
         self.match.rally((3.0, 2.0), (3.0, 10.0), settle_seconds=0)

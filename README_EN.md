@@ -267,7 +267,7 @@ RTMPose / RTMO modes:
 
 `--line-calls true` finds where the last shot of each rally landed and calls it in or out. Rallies are split from shuttle motion, so it works on fixed-camera recordings with no camera cuts.
 
-- A landing is the point where the shuttle comes to rest on the floor after flight. A shuttle that stops next to a player's hand is treated as caught, not landed.
+- A landing is where the shuttle first touches the floor. It often bounces or skids on 0.3 m or more before it stops, so the touch-down is worked out from the moment its fast flight ends, between video frames. A shuttle that stops next to a player's hand is treated as caught, not landed.
 - A shuttle on the line is in. Each call reports its distance to the nearest boundary line in cm.
 - Calls are flagged for review when the shuttle was lost before it settled, was caught, landed within 15 cm of a line, or landed within 30 cm of the net.
 - Outputs: `line_calls.json`, `line_calls_map.png` (landing points on a court diagram), and `line_calls_<video_name>.mp4` (landing point and call drawn on the video).
