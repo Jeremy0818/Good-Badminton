@@ -308,6 +308,8 @@ python -m badminton_analysis.analysis.review_web outputs/<视频名> --names "Le
 
 按键相同，另可用 ← / → 切换回合；保存到相同的文件，两种方式可以随时切换。
 
+视频下方会以四分之一速度放大重播触地瞬间（也可逐帧查看），并画出系统认定的球场线（应与地面上的线重合）和羽毛球的追踪位置；旁边的 3D 特写显示落点、误差范围以及判定的把握，例如 “OUT by 5 cm · ±38 cm · 55% sure · too close to call”，可拖动旋转视角。
+
 ### 用手机拍摄（实验功能）
 
 手机负责拍摄，本机负责录制和解码，手机上只需要浏览器（iPhone Safari 或 Android Chrome）：

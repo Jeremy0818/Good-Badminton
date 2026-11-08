@@ -310,6 +310,8 @@ python -m badminton_analysis.analysis.review_web outputs/<video_name> --names "L
 
 It uses the same keys plus ← / → to move between rallies, and saves to the same files, so you can switch between the two.
 
+Under the video, the touch-down is replayed zoomed in at quarter speed (frame by frame if you like) with the court lines drawn where the system places them, so you can see they sit on the painted lines, and the shuttle's tracked positions. Next to it, a 3D close-up shows the mark, its error ring and how sure the call is, for example "OUT by 5 cm · ±38 cm · 55% sure · too close to call". Drag to turn it.
+
 ### Filming with a Phone (Experimental)
 
 The phone films and this computer records and decodes, so the phone only needs a browser (iPhone Safari or Android Chrome):

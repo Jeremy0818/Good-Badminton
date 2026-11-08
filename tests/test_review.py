@@ -77,13 +77,14 @@ class ReviewSessionTests(unittest.TestCase):
 
 
 class ReviewWebTests(unittest.TestCase):
-    def app(self, court_frames):
-        metadata = {"video": {"fps": 10.0, "width": 1280, "height": 720}}
+    def app(self, court_frames, shuttle_points=None):
+        metadata = {"video": {"fps": 10.0, "width": 1280, "height": 720},
+                    "court": {"corners": [[400, 250], [880, 250], [1000, 650], [280, 650]]}}
         calls = [RallyCall(rally=1, start_frame=11, end_frame=101, start_sec=1.0, end_sec=10.0,
                            landing_frame=104, landing_image=[600.0, 400.0], landing_side="upper",
                            call="in", confidence="high")]
         return ReviewApp(tempfile.mkdtemp(), "video.mp4", ReviewSession(calls), metadata, calls,
-                         court_frames=court_frames)
+                         court_frames=court_frames, shuttle_points=shuttle_points)
 
     def test_clip_covers_the_end_of_the_rally_and_the_landing(self):
         rally = self.app(range(1, 200)).state()["rallies"][0]
@@ -92,6 +93,16 @@ class ReviewWebTests(unittest.TestCase):
     def test_clip_stops_when_the_broadcast_cuts_away_from_the_court(self):
         rally = self.app(range(1, 107)).state()["rallies"][0]
         self.assertEqual(rally["clip_end"], 10.5)
+
+    def test_touchdown_close_up_gets_the_court_mapping_and_nearby_shuttle_positions(self):
+        points = {frame: [600.0, 400.0 - frame] for frame in range(1, 200)}
+        state = self.app(range(1, 200), points).state()
+        top_left = state["court_to_image"]
+        corner = [sum(top_left[row][col] * v for col, v in enumerate((0.0, 0.0, 1.0))) for row in range(3)]
+        self.assertAlmostEqual(corner[0] / corner[2], 400, places=3)   # court (0, 0) is the far-left corner
+        track = state["rallies"][0]["track"]
+        self.assertEqual([track[0][0], track[-1][0]], [9.5, 10.9])   # 0.8 s before to 0.6 s after frame 104
+        self.assertEqual(track[0][1:], [600.0, 304.0])
 
     def test_decisions_are_saved(self):
         app = self.app(range(1, 200))

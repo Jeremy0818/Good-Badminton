@@ -16,6 +16,7 @@ import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from ..court.mapper import CourtMapper
 from .line_calls import LineCallConfig, compute_line_calls, load_run
 from .review import NOT_A_RALLY, load_session, save_session
 from .scoring import parse_pair
@@ -24,13 +25,19 @@ PAGE = os.path.join(os.path.dirname(__file__), "review_web.html")
 CLIP_LEAD = 3.0   # seconds of play shown before the rally ends
 CLIP_TAIL = 1.5   # seconds shown after the landing
 CHOICES = {"near": "lower", "far": "upper", "none": NOT_A_RALLY}
+TRACK_BEFORE = 0.8  # seconds of shuttle positions sent for the touch-down close-up
+TRACK_AFTER = 0.6
 
 
 class ReviewApp:
-    def __init__(self, output_dir, video_path, session, metadata, calls, match_type="singles", court_frames=()):
+    def __init__(self, output_dir, video_path, session, metadata, calls, match_type="singles", court_frames=(),
+                 shuttle_points=None):
         self.output_dir = output_dir
         # Frames from the main court camera; broadcasts cut to close-ups soon after a rally.
         self.court_frames = set(court_frames)
+        self.shuttle_points = shuttle_points or {}  # frame -> shuttle [x, y] in the image
+        corners = metadata.get("court", {}).get("corners")
+        self.court_to_image = CourtMapper([tuple(c) for c in corners]).inv_matrix.tolist() if corners else None
         self.match_type = match_type
         self.video_path = video_path
         self.session = session
@@ -58,6 +65,8 @@ class ReviewApp:
                 "landing_time": round((call.landing_frame - 1) / fps, 3) if call.landing_frame else None,
                 "landing_image": call.landing_image,
                 "landing_court": call.landing_court,
+                "landing_error_m": call.landing_error_m,
+                "track": self._track(call.landing_frame, fps),
                 "call": call.call,
                 "margin_m": call.margin_m,
                 "landing_side": call.landing_side,
@@ -72,6 +81,7 @@ class ReviewApp:
         return {
             "names": list(self.session.names),
             "match_type": self.match_type,
+            "court_to_image": self.court_to_image,  # homography for drawing court lines on the video
             "video": {"width": video["width"], "height": video["height"], "fps": fps,
                       "name": video.get("name", "")},
             "final_score": match.score_text(),
@@ -82,6 +92,14 @@ class ReviewApp:
             "next_index": self.session.first_unreviewed(),
             "rallies": rallies,
         }
+
+    def _track(self, frame, fps):
+        """Shuttle positions around the touch-down as [time, x, y]."""
+        if not frame:
+            return []
+        first, last = frame - round(TRACK_BEFORE * fps), frame + round(TRACK_AFTER * fps)
+        return [[round((f - 1) / fps, 3), *self.shuttle_points[f]] for f in range(first, last + 1)
+                if f in self.shuttle_points]
 
     def decide(self, index, choice):
         with self.lock:
@@ -180,8 +198,10 @@ def serve(output_dir, match_type="singles", player0_side="lower", start_points=(
     video_path = video_path or metadata["video"]["path"]
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Cannot find video: {video_path} (pass --video)")
+    shuttle_points = {record["frame"]: [round(float(v), 1) for v in record["shuttlecock"]["image"][:2]]
+                      for record in records if (record.get("shuttlecock") or {}).get("image")}
     app = ReviewApp(output_dir, video_path, session, metadata, calls, match_type,
-                    court_frames=(record["frame"] for record in records))
+                    court_frames=(record["frame"] for record in records), shuttle_points=shuttle_points)
     server = ThreadingHTTPServer((host, port), make_handler(app))
     print(f"Reviewing {len(calls)} rallies from {output_dir}")
     print(f"Open http://{host}:{port}  (Ctrl+C to stop)")

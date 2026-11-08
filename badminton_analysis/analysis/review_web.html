@@ -67,6 +67,33 @@
   .st-auto { color: var(--muted); } .st-ok { color: var(--in); } .st-changed { color: var(--warn); }
   .progress { height: 6px; background: var(--chip); border-radius: 999px; overflow: hidden; margin-top: 6px; }
   .progress div { height: 100%; background: var(--accent); }
+  .stage { max-width: calc(54vh * 16 / 9); margin: 0 auto; }
+  /* Touch-down close-up: zoomed slow-motion video and a 3D view of the mark. */
+  .touch { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  @media (max-width: 700px) { .touch { grid-template-columns: 1fr; } }
+  .pane { position: relative; background: #0b1410; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9; }
+  .pane .tag { position: absolute; left: 8px; top: 6px; z-index: 2; font: 600 12px sans-serif; color: #fff;
+               text-shadow: 0 0 3px #000, 0 0 3px #000; pointer-events: none; }
+  .pane .ctrl { position: absolute; left: 6px; bottom: 6px; z-index: 2; display: flex; gap: 6px; }
+  .pane .ctrl button { padding: 2px 8px; font-size: 12px; background: rgba(0, 0, 0, .55); color: #fff;
+                       border-color: rgba(255, 255, 255, .3); }
+  .pane .empty { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; padding: 16px;
+                 text-align: center; color: #b7c2bc; font-size: 13px; background: #0b1410; }
+  .pane .empty[hidden] { display: none; }
+  #zwrap { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #zwrap video, #zwrap svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #zlines .band { fill: rgba(34, 211, 238, .10); stroke: #22d3ee; stroke-width: 1; vector-effect: non-scaling-stroke; }
+  #zlines .trk { fill: #fde047; opacity: .25; }
+  #zlines .trk.seen { opacity: .8; }
+  #zlines .trk.now { fill: #fff; opacity: 1; }
+  #zlines .td { fill: none; stroke: var(--in); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  #zlines .td.out { stroke: var(--out); }
+  #view3d { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  .readout { position: absolute; right: 8px; bottom: 6px; z-index: 2; text-align: right; font: 600 14px/1.35 sans-serif;
+             color: #fff; text-shadow: 0 0 3px #000, 0 0 3px #000; pointer-events: none; }
+  .readout b.in { color: #4ade80; } .readout b.out { color: #f87171; }
+  .readout span { font-size: 12px; font-weight: 500; }
+  .readout .warn { color: #fbbf24; }
 </style>
 </head>
 <body>
@@ -80,6 +107,24 @@
     <div class="stage">
       <video id="video" src="/video" preload="auto" muted playsinline></video>
       <div class="marker" id="marker"><span></span></div>
+    </div>
+    <div class="touch">
+      <div class="pane" id="zpane">
+        <div id="zwrap">
+          <video id="zvideo" src="/video" preload="auto" muted playsinline></video>
+          <svg id="zlines" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="tag" id="ztag">Touch-down · ¼ speed · court lines in blue</div>
+        <div class="ctrl"><button id="zplay">Pause</button><button id="zback">◀ frame</button>
+          <button id="zfwd">frame ▶</button><button id="zspeed">¼×</button></div>
+        <div class="empty" id="zempty" hidden></div>
+      </div>
+      <div class="pane" id="tpane">
+        <canvas id="view3d"></canvas>
+        <div class="tag" title="Drag to turn, scroll to zoom, double-click to reset">3D close-up · drag to turn</div>
+        <div class="readout" id="readout"></div>
+        <div class="empty" id="tempty" hidden></div>
+      </div>
     </div>
     <div class="bar">
       <h2 id="title">Loading…</h2>
@@ -218,6 +263,7 @@ function highlightCourt() {
 function select(i, play = true) {
   current = Math.max(0, Math.min(i, state.rallies.length - 1));
   render();
+  updateTouch();
   if (play) replay();
 }
 
@@ -243,6 +289,8 @@ function updateMarker() {
 function drawOverlay() {
   updateMarker();
   stopAtClipEnd();
+  loopZoom();
+  updateTrack();
   requestAnimationFrame(drawOverlay);
 }
 
@@ -283,6 +331,267 @@ document.addEventListener("keydown", e => {
     arrowleft: () => select(current - 1), arrowright: () => select(current + 1) }[k];
   if (act) { e.preventDefault(); act(); }
 });
+// ---- Touch-down close-up ----
+const LW = 0.04;  // painted lines are 4 cm wide; boundary lines lie inside the area they bound
+const zv = $("zvideo");
+const SPEEDS = [0.25, 0.5, 1];
+const SPEED_LABEL = { 0.25: "¼", 0.5: "½", 1: "1" };
+let zSpeed = 0.25, cam = { az: 0, el: 35, dist: 1.8 }, drag = null, lastDot = -2;
+
+const showTouch = r => hasLanding(r) && !lost(r) && r.landing_image && r.landing_time != null;
+
+function lineBands() {  // [x0, y0, x1, y1] in court metres
+  return [
+    [0, 0, W, LW], [0, L - LW, W, L], [0, 0, LW, L], [W - LW, 0, W, L],                        // outer boundary
+    [SM, 0, SM + LW, L], [W - SM - LW, 0, W - SM, L],                                           // singles sidelines
+    [0, BS - LW / 2, W, BS + LW / 2], [0, L - BS - LW / 2, W, L - BS + LW / 2],                 // doubles long service
+    [0, NET - SL - LW / 2, W, NET - SL + LW / 2], [0, NET + SL - LW / 2, W, NET + SL + LW / 2], // short service
+    [W / 2 - LW / 2, 0, W / 2 + LW / 2, NET - SL], [W / 2 - LW / 2, NET + SL, W / 2 + LW / 2, L], // centre
+  ];
+}
+
+function toImage(x, y) {
+  const m = state.court_to_image, w = m[2][0] * x + m[2][1] * y + m[2][2];
+  return [(m[0][0] * x + m[0][1] * y + m[0][2]) / w, (m[1][0] * x + m[1][1] * y + m[1][2]) / w];
+}
+
+function decidingLine(r) {
+  // The boundary that decides the call: smallest signed distance, positive inside (as in line_calls).
+  const [x, y] = r.landing_court, singles = state.match_type !== "doubles";
+  const lo = singles ? SM : 0, hi = singles ? W - SM : W;
+  return [{ m: x - lo, n: [-1, 0], axis: 0 }, { m: hi - x, n: [1, 0], axis: 0 },
+          { m: y, n: [0, -1], axis: 1 }, { m: L - y, n: [0, 1], axis: 1 }].reduce((a, b) => b.m < a.m ? b : a);
+}
+
+function updateTouch() {
+  const r = state.rallies[current], ok = showTouch(r);
+  for (const id of ["zempty", "tempty"]) {
+    $(id).hidden = ok;
+    $(id).textContent = !hasLanding(r) ? "No landing found."
+      : "Landing not seen: the shuttle was lost in the air, so there is no touch-down to show.";
+  }
+  $("readout").innerHTML = "";
+  if (!ok) { zv.pause(); return; }
+  cam = { az: 0, el: 35, dist: 1.8 };
+  layoutZoom();
+  drawZoomLines();
+  draw3d();
+  readout();
+  zv.defaultPlaybackRate = zv.playbackRate = zSpeed;
+  zv.currentTime = zoomWindow(r)[0];
+  zv.play().catch(() => {});
+  $("zplay").textContent = "Pause";
+}
+
+function zoomWindow(r) {
+  return [Math.max(r.clip_start, r.landing_time - 0.6), Math.min(r.clip_end, r.landing_time + 0.5)];
+}
+
+function layoutZoom() {
+  const r = state.rallies[current], pane = $("zpane"), wrap = $("zwrap"), V = state.video;
+  if (!showTouch(r)) return;
+  const k = pane.clientHeight / (0.16 * V.height);  // show about a sixth of the frame height
+  wrap.style.width = `${V.width}px`;
+  wrap.style.height = `${V.height}px`;
+  wrap.style.transform = `translate(${pane.clientWidth / 2 - r.landing_image[0] * k}px, ` +
+    `${pane.clientHeight / 2 - r.landing_image[1] * k}px) scale(${k})`;
+}
+
+function drawZoomLines() {
+  // Lines where the court mapping puts them: they should sit on the painted lines.
+  const r = state.rallies[current], V = state.video, svg = $("zlines");
+  svg.setAttribute("viewBox", `0 0 ${V.width} ${V.height}`);
+  let html = "";
+  if (state.court_to_image) {
+    for (const [x0, y0, x1, y1] of lineBands()) {
+      const pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(p => toImage(p[0], p[1]).map(v => v.toFixed(1)).join(","));
+      html += `<polygon class="band" points="${pts.join(" ")}"/>`;
+    }
+  }
+  r.track.forEach(([, x, y]) => { html += `<circle class="trk" cx="${x}" cy="${y}" r="${V.height * 0.0035}"/>`; });
+  html += `<circle class="td ${r.call}" cx="${r.landing_image[0]}" cy="${r.landing_image[1]}" r="${V.height * 0.01}"/>`;
+  svg.innerHTML = html;
+  lastDot = -2;
+}
+
+function updateTrack() {
+  // Shuttle positions up to the frame on screen; the latest one in white.
+  const r = state && state.rallies[current];
+  if (!r || !showTouch(r)) return;
+  let now = -1;
+  r.track.forEach(([t], i) => { if (t <= zv.currentTime + 0.001) now = i; });
+  if (now === lastDot) return;
+  lastDot = now;
+  $("zlines").querySelectorAll(".trk").forEach((c, i) =>
+    c.setAttribute("class", i < now ? "trk seen" : i === now ? "trk now" : "trk"));
+}
+
+function loopZoom() {
+  const r = state && state.rallies[current];
+  if (!r || !showTouch(r) || zv.paused) return;
+  const [a, b] = zoomWindow(r);
+  if (zv.currentTime >= b || zv.currentTime < a - 0.1) zv.currentTime = a;
+}
+zv.addEventListener("timeupdate", loopZoom);
+
+function stepFrame(d) {
+  const [a, b] = zoomWindow(state.rallies[current]);
+  zv.pause();
+  $("zplay").textContent = "Play";
+  zv.currentTime = Math.max(a, Math.min(b, zv.currentTime + d / state.video.fps));
+}
+$("zback").onclick = () => stepFrame(-1);
+$("zfwd").onclick = () => stepFrame(1);
+$("zplay").onclick = () => {
+  if (zv.paused) { zv.play().catch(() => {}); $("zplay").textContent = "Pause"; }
+  else { zv.pause(); $("zplay").textContent = "Play"; }
+};
+$("zspeed").onclick = () => {
+  zSpeed = SPEEDS[(SPEEDS.indexOf(zSpeed) + 1) % SPEEDS.length];
+  zv.defaultPlaybackRate = zv.playbackRate = zSpeed;
+  $("zspeed").textContent = `${SPEED_LABEL[zSpeed]}×`;
+  $("ztag").textContent = `Touch-down · ${zSpeed === 1 ? "full" : SPEED_LABEL[zSpeed]} speed · court lines in blue`;
+};
+
+function normalCdf(z) {  // Abramowitz & Stegun 7.1.26
+  const t = 1 / (1 + 0.3275911 * Math.abs(z) / Math.SQRT2);
+  const erf = 1 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t)
+    * Math.exp(-z * z / 2);
+  return z >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+}
+
+function readout() {
+  const r = state.rallies[current], d = decidingLine(r), call = d.m >= 0 ? "in" : "out";
+  const sigma = r.landing_error_m ? r.landing_error_m[d.axis] : null;
+  let html = `<b class="${call}">${call.toUpperCase()}</b> by ${Math.round(Math.abs(d.m) * 100)} cm`;
+  if (sigma) {
+    // Chance the shuttle really landed on this side of the line, given the error of the estimate.
+    const sure = normalCdf(Math.abs(d.m) / sigma);
+    const note = sure >= 0.95 ? "" : sure >= 0.8 ? " · likely" : " · too close to call";
+    html += `<br><span class="${sure >= 0.95 ? "" : "warn"}">±${Math.round(sigma * 100)} cm · ${Math.round(100 * sure)}% sure${note}</span>`;
+  }
+  if (r.landing_method === "held") html += `<br><span class="warn">near a hand: caught or picked up?</span>`;
+  $("readout").innerHTML = html;
+}
+
+// 3D view: z is up; court x across, y along. Seen from inside the court, looking out over the deciding line.
+const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const unit3 = a => { const n = Math.hypot(...a); return [a[0] / n, a[1] / n, a[2] / n]; };
+
+function clipNear(q, near = 0.02) {  // keep the part of a camera-space polygon in front of the camera
+  const out = [];
+  q.forEach((a, i) => {
+    const b = q[(i + 1) % q.length];
+    if (a[2] >= near) out.push(a);
+    if ((a[2] >= near) !== (b[2] >= near)) {
+      const t = (near - a[2]) / (b[2] - a[2]);
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, near]);
+    }
+  });
+  return out;
+}
+
+function hull(pts) {  // convex hull, monotone chain
+  pts = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const turn = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const half = list => list.reduce((h, p) => {
+    while (h.length >= 2 && turn(h[h.length - 2], h[h.length - 1], p) <= 0) h.pop();
+    h.push(p);
+    return h;
+  }, []);
+  const lower = half(pts), upper = half(pts.slice().reverse());
+  return lower.slice(0, -1).concat(upper.slice(0, -1));
+}
+
+function draw3d() {
+  const r = state.rallies[current], canvas = $("view3d");
+  const cw = canvas.clientWidth, ch = canvas.clientHeight, dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = "#0b1410";
+  g.fillRect(0, 0, cw, ch);
+  if (!showTouch(r)) return;
+
+  const d = decidingLine(r), [mx, my] = r.landing_court;
+  const shift = Math.max(-0.5, Math.min(0.5, d.m)) / 2;  // aim between the mark and the line
+  const target = [mx + d.n[0] * shift, my + d.n[1] * shift, 0];
+  const yaw = Math.atan2(-d.n[1], -d.n[0]) + cam.az * Math.PI / 180, pitch = cam.el * Math.PI / 180;
+  const eye = [target[0] + cam.dist * Math.cos(pitch) * Math.cos(yaw),
+               target[1] + cam.dist * Math.cos(pitch) * Math.sin(yaw), cam.dist * Math.sin(pitch)];
+  // Court coordinates are mirrored (y runs toward the near camera), so right = up x forward.
+  const fwd = unit3(sub3(target, eye)), right = unit3(cross3([0, 0, 1], fwd)), up = cross3(fwd, right);
+  const focal = (ch / 2) / Math.tan(25 * Math.PI / 180);
+  const toCam = p => { const v = sub3(p, eye); return [dot3(v, right), dot3(v, up), dot3(v, fwd)]; };
+  const toScreen = q => [cw / 2 + focal * q[0] / q[2], ch / 2 - focal * q[1] / q[2]];
+  const path = q => { g.beginPath(); q.forEach((p, i) => { const s = toScreen(p); i ? g.lineTo(...s) : g.moveTo(...s); }); g.closePath(); };
+  const poly = (pts, fill, stroke, dash) => {
+    const q = clipNear(pts.map(toCam));
+    if (q.length < 3) return;
+    path(q);
+    if (fill) { g.fillStyle = fill; g.fill(); }
+    if (stroke) { g.setLineDash(dash || []); g.strokeStyle = stroke; g.lineWidth = 1.5; g.stroke(); g.setLineDash([]); }
+  };
+  const rect = (x0, y0, x1, y1) => [[x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0]];
+  const ring = (cx, cy, rx, ry, z = 0, n = 48) =>
+    Array.from({ length: n }, (_, i) => [cx + rx * Math.cos(2 * Math.PI * i / n), cy + ry * Math.sin(2 * Math.PI * i / n), z]);
+  const singles = state.match_type !== "doubles";
+
+  poly(rect(-8, -8, W + 8, L + 8), "#1c3a26");                                      // floor outside
+  poly(singles ? rect(SM, 0, W - SM, L) : rect(0, 0, W, L), "#2f6b3a");              // in
+  for (const [x0, y0, x1, y1] of lineBands()) poly(rect(x0, y0, x1, y1), "#f4f6f1"); // painted lines
+  // Net: posts on the doubles sidelines, mesh from 0.76 m to the tape at 1.55 m.
+  const netBehind = Math.abs(NET - eye[1]) > Math.abs(NET - my);
+  const drawNet = () => {
+    poly([[0, NET, 0.76], [W, NET, 0.76], [W, NET, 1.55], [0, NET, 1.55]], "rgba(10, 12, 11, .55)");
+    poly([[0, NET, 1.49], [W, NET, 1.49], [W, NET, 1.55], [0, NET, 1.55]], "#f4f6f1");
+  };
+  if (netBehind) drawNet();
+
+  const color = r.call === "out" ? "#f87171" : "#4ade80";
+  if (r.landing_error_m) {                                                            // 1-sigma error ring
+    poly(ring(mx, my, r.landing_error_m[0], r.landing_error_m[1]), "rgba(255, 255, 255, .10)", "rgba(255, 255, 255, .85)", [6, 4]);
+  }
+  poly(ring(mx, my, 0.0135, 0.0135, 0, 24), color);                                  // where the cork touched
+  // The shuttle standing on its cork: cork ball, then the feather skirt as the hull of its two rims.
+  const cork = toCam([mx, my, 0.014]);
+  if (cork[2] > 0.05) {
+    const c = toScreen(cork);
+    g.beginPath(); g.arc(c[0], c[1], focal * 0.014 / cork[2], 0, 2 * Math.PI);
+    g.fillStyle = "#e9e4d8"; g.fill(); g.strokeStyle = "#6b7280"; g.lineWidth = 1; g.stroke();
+    const rims = ring(mx, my, 0.012, 0.012, 0.024, 24).concat(ring(mx, my, 0.033, 0.033, 0.09, 24)).map(toCam);
+    if (rims.every(q => q[2] > 0.05)) {
+      const skirt = hull(rims.map(toScreen));
+      g.beginPath(); skirt.forEach((s, i) => i ? g.lineTo(...s) : g.moveTo(...s)); g.closePath();
+      g.fillStyle = "rgba(250, 250, 248, .85)"; g.fill(); g.strokeStyle = "#9ca3af"; g.stroke();
+    }
+  }
+  if (!netBehind) drawNet();
+}
+
+const canvas3d = $("view3d");
+canvas3d.addEventListener("pointerdown", e => {
+  drag = { x: e.clientX, y: e.clientY, az: cam.az, el: cam.el };
+  canvas3d.setPointerCapture(e.pointerId);
+});
+canvas3d.addEventListener("pointermove", e => {
+  if (!drag) return;
+  cam.az = drag.az - (e.clientX - drag.x) * 0.4;
+  cam.el = Math.max(5, Math.min(89, drag.el + (e.clientY - drag.y) * 0.3));
+  draw3d();
+});
+canvas3d.addEventListener("pointerup", () => { drag = null; });
+canvas3d.addEventListener("wheel", e => {
+  e.preventDefault();
+  cam.dist = Math.max(0.4, Math.min(12, cam.dist * Math.exp(e.deltaY * 0.001)));
+  draw3d();
+}, { passive: false });
+canvas3d.addEventListener("dblclick", () => { cam = { az: 0, el: 35, dist: 1.8 }; draw3d(); });
+window.addEventListener("resize", () => { if (state) { layoutZoom(); draw3d(); } });
+
 requestAnimationFrame(drawOverlay);
 load();
 </script>
