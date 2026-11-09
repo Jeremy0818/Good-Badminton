@@ -354,6 +354,8 @@ With the phone: once it is in place, press **Mark the court** on this computer's
 python -m badminton_analysis.live.capture --replay videos/<video>.mp4 --start 638 --seconds 60
 ```
 
+To review rallies during the game, follow the link under the line calls. It opens the review page on the phone's recording so far: each rally appears a few seconds after its call, with its clip, the slow-motion touch-down close-up and the 3D view, and the page moves on to each new rally while you are on the latest one. Accept or correct the calls as in a review afterwards; the score follows, and the decisions are saved in `review.json` next to the recording. The clips are cut from the recording while it is still being written, into `clips/` next to it. Give the players' names with `--names "Ana,Bo"` and the side player 1 starts on with `--player1-side`.
+
 Keep the phone still once the court is marked: a shift of a few pixels moves landings near the far baseline by 10 cm or more. If the picture moves 2 px or more, the page says so; mark the court again.
 
 On an Apple M3 Pro it keeps up with a phone at 30 fps. The phone's frames are decoded at 720p; tracking every frame of the 60 s above, as for a phone, whose view never cuts away, took 17–27 ms of the 33 ms a frame lasts, dropped no frames and was never more than 2 s behind (the spread came from other apps using the computer at the time). 60 fps would not fit. To measure another computer, add `--every-frame` to the replay command; a broadcast's replays and close-ups are then tracked too and can give a stray call.

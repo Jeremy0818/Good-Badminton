@@ -156,6 +156,35 @@ class CaptureServerTests(unittest.TestCase):
         for session in (second, again):
             self.app.stop(session)
 
+    def test_review_page_follows_a_phones_rallies(self):
+        local = self.serve(phone=False)
+        folder = os.path.join(self.out, "recording")
+        os.makedirs(folder)
+        phone = self.app.phones["a"] = Phone("a", 1)
+        phone.court = {"corners": [[100, 80], [220, 80], [260, 200], [60, 200]]}
+        phone.session = CaptureSession(folder, {"fps": 30})
+        phone.session.calls = [RallyCall(rally=1, start_frame=31, end_frame=298, start_sec=1.0, end_sec=9.9,
+                                         landing_frame=301, landing_court=[3.0, 12.0], landing_side="lower",
+                                         call="in", margin_m=0.5, landing_method="settled", confidence="high")]
+        clip = os.path.join(folder, "rally-1.mp4")
+        with open(clip, "wb") as file:
+            file.write(b"0123456789")
+        phone.session.clipper = SimpleNamespace(clips={1: {"file": clip, "start": 7.0, "end": 11.5, "error": None}})
+        with urllib.request.urlopen(local + "/review?phone=a", timeout=10) as response:
+            self.assertIn(b"Rally Review", response.read())
+        with urllib.request.urlopen(local + "/api/state?phone=a", timeout=10) as response:
+            state = json.load(response)
+        self.assertTrue(state["live"])
+        self.assertEqual(state["rallies"][0]["video"], f"/review/clip?s={phone.session.id}&n=1")
+        request = urllib.request.Request(local + state["rallies"][0]["video"], headers={"Range": "bytes=2-5"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual((response.status, response.read()), (206, b"2345"))
+        state = self.post(local + "/api/decide?phone=a", json.dumps({"index": 0, "choice": "near"}).encode())
+        self.assertEqual(state["rallies"][0]["decision"], "lower")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post(local + "/api/decide?phone=a", json.dumps({"index": 5, "choice": "near"}).encode())
+        self.assertEqual(caught.exception.code, 400)
+
     def test_calls_of_phones_filming_together_are_combined(self):
         # Phone 1 sees the landing near its far baseline 10 cm out, give or take 40; phone 2 at the other end,
         # started 3.2 s later with its court marked from its own end, sees it 7 cm in.

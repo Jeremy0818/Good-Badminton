@@ -36,8 +36,10 @@ import numpy as np
 
 from ..analysis.line_calls import LiveLineCaller
 from ..analysis.multi_camera import COMBINED_CALLS, combine, write_combined
+from ..analysis.review_web import PAGE as REVIEW_PAGE, send_file
 from ..court.mapper import resolve_court_corners
 from ..data.writer import JsonlDetectionWriter
+from .live_review import CLIPS, ClipCutter, LiveReview, touchdown_track
 from .tracker import LIVE_CALLS, LIVE_DETECTIONS, LiveTracker
 
 HERE = os.path.dirname(__file__)
@@ -126,6 +128,9 @@ class CaptureSession:
         self.stopped = None
         self.live = None   # LiveCalls once the court has been marked
         self.calls = []    # line calls made so far
+        self.tracks = {}       # rally -> shuttle positions around its touch-down, for the review
+        self.clipper = None    # ClipCutter, cutting each called rally's clip
+        self.review = None     # LiveReview, once the review page has asked for this recording
         self.lock = threading.Lock()
         open(self.path, "wb").close()
         self.write_info()
@@ -318,6 +323,7 @@ class LiveCalls(threading.Thread):
     def __init__(self, session, court, models, backlog=5.0, every_frame=False, on_calls=None):
         super().__init__(daemon=True)
         self.on_calls = on_calls   # called from this thread after each new call
+        self.points = {}           # frame -> shuttle [x, y] in the picture lately, for the touch-down close-ups
         tracknet, pose = models
         tracknet.background = None   # left from an earlier recording
         metadata = {"video": {"fps": session.fps, "width": court["size"][0], "height": court["size"][1]},
@@ -352,6 +358,16 @@ class LiveCalls(threading.Thread):
         except queue.Full:
             self.dropped += 1
 
+    def _clips(self):
+        session = self.session
+        if session.clipper is None:
+            # Cut from the stream while it grows, and from the saved recording once that has replaced it.
+            session.clipper = ClipCutter(
+                lambda: session.path if os.path.exists(session.path) else session.saved_path or session.path,
+                os.path.join(session.folder, CLIPS), session.fps, DECODE_HEIGHT)
+            session.clipper.start()
+        return session.clipper
+
     def end(self):
         self.frames.put(None)
 
@@ -377,14 +393,21 @@ class LiveCalls(threading.Thread):
                             self._measure_shift(image)
                     for record in records:
                         writer.write(record)
+                        point = (record.get("shuttlecock") or {}).get("image")
+                        if point:
+                            self.points[record["frame"]] = [round(float(value), 1) for value in point[:2]]
                     for call in calls:
                         call.rally = len(session.calls) + 1   # numbered across a court marked again
+                        session.tracks[call.rally] = touchdown_track(self.points, call, fps)
                         session.calls.append(call)
+                        self._clips().add(call)
                     if calls:
                         with open(os.path.join(session.folder, LIVE_CALLS), "w", encoding="utf-8") as file:
                             json.dump([asdict(call) for call in session.calls], file, indent=1)
                         if self.on_calls:
                             self.on_calls()
+                        recent = self.tracker.done_through - round(30 * fps)   # later calls need no older positions
+                        self.points = {frame: point for frame, point in self.points.items() if frame >= recent}
                     if item is None:
                         break
         except Exception as error:   # shown on the page; recording goes on
@@ -417,9 +440,11 @@ class CaptureApp:
     """Phones filming at the same time each record and are tracked on their own. Once two or more of them make
     calls, the calls are combined (analysis/multi_camera.py)."""
 
-    def __init__(self, out_dir, key, phone_urls=(), every_frame=False):
+    def __init__(self, out_dir, key, phone_urls=(), every_frame=False, names=("Player 1", "Player 2"),
+                 player0_side="lower"):
         self.out_dir = out_dir
         self.every_frame = every_frame   # see LiveCalls
+        self.names, self.player0_side = tuple(names), player0_side   # for the score in the live review
         self.key = key
         self.phone_urls = list(phone_urls)
         self.phones = {}         # by the id each phone's page keeps, in the order they first connected
@@ -510,6 +535,33 @@ class CaptureApp:
             if phone.session is not None and phone.session.id == session_id:
                 return phone.session
         raise LookupError(f"no recording {session_id}")
+
+    def _review(self, phone_id):
+        phone = self.phone(phone_id)
+        session = phone.session
+        if session is None:
+            raise LookupError("no recording from this phone yet")
+        if session.review is None:
+            session.review = LiveReview(session, self.names, self.player0_side)
+        return phone, session
+
+    def review_state(self, phone_id=None):
+        """The phone's latest recording as the review page shows it, a rally added once its clip is cut."""
+        phone, session = self._review(phone_id)
+        size = phone.decoder.size if phone.decoder and phone.decoder.size else (1280, DECODE_HEIGHT)
+        return session.review.state(phone.court, size, lambda rally: f"/review/clip?s={session.id}&n={rally}")
+
+    def review_decide(self, phone_id, index, choice):
+        _, session = self._review(phone_id)
+        session.review.decide(index, choice)
+        return self.review_state(phone_id)
+
+    def clip_file(self, session_id, rally):
+        session = self._session(session_id)
+        clip = session.clipper.clips.get(rally) if session.clipper else None
+        if not clip or clip["error"]:
+            raise LookupError(f"no clip of rally {rally}")
+        return clip["file"]
 
     def add_piece(self, session_id, seq, data):
         session = self._session(session_id)
@@ -706,6 +758,20 @@ def make_handler(app, phone):
                 self._page(PHONE_PAGE if phone else WATCH_PAGE)
             elif path == "/camera" and not phone:
                 self._page(PHONE_PAGE)  # film with this computer's own camera, or ?test=1 for a test pattern
+            elif path == "/review" and not phone:
+                self._page(REVIEW_PAGE)  # ?phone=<id>: that phone's rallies so far, as they are called
+            elif path == "/api/state" and not phone:
+                try:
+                    self._json(app.review_state(query.get("phone")))
+                except LookupError as error:
+                    self._json({"error": str(error)}, 404)
+            elif path == "/review/clip" and not phone:
+                try:
+                    clip = app.clip_file(query["s"], int(query["n"]))
+                except (KeyError, ValueError, LookupError):
+                    self._send(404, b"no such clip", "text/plain")
+                else:
+                    send_file(self, clip, "video/mp4")
             elif path == "/api/status":
                 if self._allowed():
                     self._json(app.status(query.get("s")))
@@ -749,6 +815,12 @@ def make_handler(app, phone):
                     self._json(app.suggest_court(query.get("phone")))
                 elif url.path == "/api/court" and not phone:
                     self._json({"court": app.set_court(json.loads(body)["corners"], query.get("phone"))})
+                elif url.path == "/api/decide" and not phone:   # from the review page
+                    choice = json.loads(body or b"{}")
+                    try:
+                        self._json(app.review_decide(query.get("phone"), int(choice["index"]), choice["choice"]))
+                    except (ValueError, IndexError) as error:
+                        self._json({"error": str(error)}, 400)
                 else:
                     self._send(404, b"not found", "text/plain")
             except LookupError as error:
@@ -803,13 +875,14 @@ def replay_as_phone(app, video, start=0.0, seconds=None, phone="replay"):
     app.stop(session)
 
 
-def serve(out_dir="recordings", phone_port=8443, local_port=8080, replays=(), every_frame=False):
+def serve(out_dir="recordings", phone_port=8443, local_port=8080, replays=(), every_frame=False,
+          names=("Player 1", "Player 2"), player0_side="lower"):
     tls_dir = os.path.join(out_dir, ".tls")
     address, hostname = lan_address(), local_hostname()
     cert, key_file = ensure_certificate(tls_dir, [address, hostname, "localhost"])
     key = access_key(tls_dir)
     urls = [f"https://{host}:{phone_port}/?k={key}" for host in (hostname, address)]
-    app = CaptureApp(out_dir, key, urls, every_frame=every_frame)
+    app = CaptureApp(out_dir, key, urls, every_frame=every_frame, names=names, player0_side=player0_side)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key_file)
@@ -848,6 +921,9 @@ def main():
     parser.add_argument("--start", type=float, nargs="+", default=[0.0],
                         help="Second of the --replay videos to start at: one for all, or one each")
     parser.add_argument("--seconds", type=float, default=None, help="Seconds of the --replay videos to send")
+    parser.add_argument("--names", default="Player 1,Player 2", help="Players' names for the score in the review")
+    parser.add_argument("--player1-side", choices=["upper", "lower"], default="lower",
+                        help="Side player 1 starts on, as the first phone sees it (upper = far, lower = near)")
     parser.add_argument("--every-frame", action="store_true",
                         help="Track every frame, even one that does not look like the marked court, as for a phone: "
                              "a --replay of a broadcast then puts on the load of a phone")
@@ -858,7 +934,8 @@ def main():
         if len(starts) != len(args.replay):
             parser.error("give one --start for all --replay videos, or one each")
         replays = [(video, start, args.seconds) for video, start in zip(args.replay, starts)]
-    serve(args.out, args.phone_port, args.port, replays, args.every_frame)
+    serve(args.out, args.phone_port, args.port, replays, args.every_frame, tuple(args.names.split(",", 1)),
+          args.player1_side)
 
 
 if __name__ == "__main__":

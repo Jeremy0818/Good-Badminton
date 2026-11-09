@@ -105,13 +105,13 @@
 <main>
   <section class="card">
     <div class="stage">
-      <video id="video" src="/video" preload="auto" muted playsinline></video>
+      <video id="video" preload="auto" muted playsinline></video>
       <div class="marker" id="marker"><span></span></div>
     </div>
     <div class="touch">
       <div class="pane" id="zpane">
         <div id="zwrap">
-          <video id="zvideo" src="/video" preload="auto" muted playsinline></video>
+          <video id="zvideo" preload="auto" muted playsinline></video>
           <svg id="zlines" preserveAspectRatio="none"></svg>
         </div>
         <div class="tag" id="ztag">Touch-down · ¼ speed · court lines in blue</div>
@@ -175,10 +175,47 @@ const lost = r => r.landing_method === "last_seen";
 const hasLanding = r => r.landing_court && (r.call === "in" || r.call === "out");
 const winnerText = (side, r) => side ? `${r.sides[side]} (${sideLabel(side)})` : "–";
 
+// The page's own query (a live review names its phone) goes with every request.
+async function fetchState() {
+  const res = await fetch("/api/state" + location.search);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
 async function load() {
-  state = await (await fetch("/api/state")).json();
+  try { state = await fetchState(); }
+  catch (error) { $("title").textContent = error.message; setTimeout(load, 2000); return; }
+  if (state.live) {
+    document.querySelector("h1").textContent = "Rally Review · live";
+    setTimeout(follow, 2000);
+  }
+  if (!state.rallies.length) return waiting();
   drawCourt();
   select(Math.min(state.next_index, state.rallies.length - 1), true);
+}
+
+function waiting() {
+  $("title").textContent = "No rally yet: each one appears here a few seconds after the shuttle lands.";
+  for (const id of ["zempty", "tempty"]) { $(id).hidden = false; $(id).textContent = "No rally yet."; }
+}
+
+// A live review adds each rally as it is called, and moves on to it while you are on the latest one.
+async function follow() {
+  try {
+    const next = await fetchState();
+    const latest = !state.rallies.length || current >= state.rallies.length - 1;
+    const added = next.rallies.length > state.rallies.length;
+    state = next;
+    if (state.rallies.length) {
+      drawCourt();
+      if (added && latest) select(state.rallies.length - 1);
+      else render();
+    }
+  } catch (error) {
+    // the computer may be busy or restarting: try again
+  }
+  setTimeout(follow, 2000);
 }
 
 function render() {
@@ -261,14 +298,27 @@ function highlightCourt() {
 }
 
 function select(i, play = true) {
+  if (!state.rallies.length) return;
   current = Math.max(0, Math.min(i, state.rallies.length - 1));
+  useVideo(state.rallies[current]);
   render();
   updateTouch();
   if (play) replay();
 }
 
+function useVideo(r) {   // a live review gives each rally a clip of its own
+  const src = r.video || (state.live ? null : "/video");
+  if (src === null) {
+    video.removeAttribute("src");
+    zv.removeAttribute("src");
+  } else if (video.getAttribute("src") !== src) {
+    video.src = zv.src = src;
+  }
+}
+
 function replay() {
   const r = state.rallies[current];
+  if (!r) return;
   video.currentTime = r.clip_start;
   video.play().catch(() => {});
 }
@@ -307,7 +357,8 @@ video.addEventListener("seeked", updateMarker);
 video.addEventListener("pause", updateMarker);
 
 async function decide(choice) {
-  const res = await fetch("/api/decide", { method: "POST", headers: { "Content-Type": "application/json" },
+  if (!state || !state.rallies.length) return;
+  const res = await fetch("/api/decide" + location.search, { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ index: current, choice }) });
   const data = await res.json();
   if (!res.ok) { $("decision").textContent = data.error === "no automatic call to accept"
@@ -590,7 +641,7 @@ canvas3d.addEventListener("wheel", e => {
   draw3d();
 }, { passive: false });
 canvas3d.addEventListener("dblclick", () => { cam = { az: 0, el: 35, dist: 1.8 }; draw3d(); });
-window.addEventListener("resize", () => { if (state) { layoutZoom(); draw3d(); } });
+window.addEventListener("resize", () => { if (state && state.rallies.length) { layoutZoom(); draw3d(); } });
 
 requestAnimationFrame(drawOverlay);
 load();

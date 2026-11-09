@@ -57,41 +57,15 @@ class ReviewApp:
             last = end_frame
             while last + 1 in self.court_frames and last < end_frame + CLIP_TAIL * fps:
                 last += 1
-            rallies.append({
-                "index": index,
-                "rally": call.rally,
+            rallies.append(rally_state(index, call, row, self.session, {
                 "clip_start": round(start, 3),
                 "clip_end": round((last - 1) / fps, 3),
                 "landing_time": round((call.landing_frame - 1) / fps, 3) if call.landing_frame else None,
-                "landing_image": call.landing_image,
-                "landing_court": call.landing_court,
-                "landing_error_m": call.landing_error_m,
                 "track": self._track(call.landing_frame, fps),
-                "call": call.call,
-                "margin_m": call.margin_m,
-                "landing_side": call.landing_side,
-                "landing_method": call.landing_method,
-                "confidence": call.confidence,
-                "flags": call.flags,
-                "predicted_side": self.session.predicted_side(index),
-                "decision": self.session.decisions.get(call.rally),
-                **{key: row[key] for key in ("winner_side", "winner", "score_before", "score_after",
-                                             "game", "sides", "reviewed", "changed")},
-            })
-        return {
-            "names": list(self.session.names),
-            "match_type": self.match_type,
-            "court_to_image": self.court_to_image,  # homography for drawing court lines on the video
-            "video": {"width": video["width"], "height": video["height"], "fps": fps,
-                      "name": video.get("name", "")},
-            "final_score": match.score_text(),
-            "games": list(match.games),
-            "points": list(match.points),
-            "reviewed": sum(r["reviewed"] for r in rallies),
-            "changed": sum(r["changed"] for r in rallies),
-            "next_index": self.session.first_unreviewed(),
-            "rallies": rallies,
-        }
+            }))
+        return review_state(self.session, rallies, match, self.match_type, self.court_to_image,
+                            {"width": video["width"], "height": video["height"], "fps": fps,
+                             "name": video.get("name", "")})
 
     def _track(self, frame, fps):
         """Shuttle positions around the touch-down as [time, x, y]."""
@@ -103,16 +77,96 @@ class ReviewApp:
 
     def decide(self, index, choice):
         with self.lock:
-            if choice == "accept":
-                if not self.session.accept(index):
-                    raise ValueError("no automatic call to accept")
-            elif choice == "clear":
-                self.session.decisions.pop(self.calls[index].rally, None)
-            elif choice in CHOICES:
-                self.session.decide(index, CHOICES[choice])
-            else:
-                raise ValueError(f"unknown choice: {choice}")
+            apply_choice(self.session, index, choice)
             save_session(self.output_dir, self.session)
+
+
+def rally_state(index, call, row, session, times):
+    """One rally as the page shows it. times says where to find it in the video the page plays: clip_start,
+    clip_end and landing_time in seconds, the shuttle's track around the touch-down as [seconds, x, y], and the
+    "video" address when the rally has a clip of its own (live review)."""
+    return {
+        "index": index,
+        "rally": call.rally,
+        **times,
+        "landing_image": call.landing_image,
+        "landing_court": call.landing_court,
+        "landing_error_m": call.landing_error_m,
+        "call": call.call,
+        "margin_m": call.margin_m,
+        "landing_side": call.landing_side,
+        "landing_method": call.landing_method,
+        "confidence": call.confidence,
+        "flags": call.flags,
+        "predicted_side": session.predicted_side(index),
+        "decision": session.decisions.get(call.rally),
+        **{key: row[key] for key in ("winner_side", "winner", "score_before", "score_after",
+                                     "game", "sides", "reviewed", "changed")},
+    }
+
+
+def review_state(session, rallies, match, match_type, court_to_image, video):
+    return {
+        "names": list(session.names),
+        "match_type": match_type,
+        "court_to_image": court_to_image,  # homography for drawing court lines on the video
+        "video": video,
+        "final_score": match.score_text(),
+        "games": list(match.games),
+        "points": list(match.points),
+        "reviewed": sum(r["reviewed"] for r in rallies),
+        "changed": sum(r["changed"] for r in rallies),
+        "next_index": session.first_unreviewed(),
+        "rallies": rallies,
+    }
+
+
+def apply_choice(session, index, choice):
+    """A reviewer's choice for rally index: accept the automatic call, pick the winning side, not a rally, or
+    clear the decision."""
+    if choice == "accept":
+        if not session.accept(index):
+            raise ValueError("no automatic call to accept")
+    elif choice == "clear":
+        session.decisions.pop(session.calls[index].rally, None)
+    elif choice in CHOICES:
+        session.decide(index, CHOICES[choice])
+    else:
+        raise ValueError(f"unknown choice: {choice}")
+
+
+def send_file(handler, path, content_type=None):
+    """Send a video file, or the byte range the browser asked for: it seeks with Range requests."""
+    size = os.path.getsize(path)
+    start, end = 0, size - 1
+    match = re.match(r"bytes=(\d*)-(\d*)", handler.headers.get("Range", ""))
+    if match:
+        if match.group(1):
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else size - 1
+        else:
+            start = size - int(match.group(2))
+        end = min(end, size - 1)
+        handler.send_response(206)
+        handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+    else:
+        handler.send_response(200)
+    handler.send_header("Content-Type", content_type or mimetypes.guess_type(path)[0] or "video/mp4")
+    handler.send_header("Accept-Ranges", "bytes")
+    handler.send_header("Content-Length", str(end - start + 1))
+    handler.end_headers()
+    with open(path, "rb") as file:
+        file.seek(start)
+        remaining = end - start + 1
+        try:
+            while remaining > 0:
+                chunk = file.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser cancels ranges it no longer needs
 
 
 def make_handler(app):
@@ -139,7 +193,7 @@ def make_handler(app):
                 with app.lock:
                     self._json(app.state())
             elif self.path == "/video":
-                self._send_video()
+                send_file(self, app.video_path)
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -153,39 +207,6 @@ def make_handler(app):
                 return self._json({"error": str(error)}, 400)
             with app.lock:
                 self._json(app.state())
-
-        def _send_video(self):
-            # The browser seeks with Range requests, so serve byte ranges.
-            size = os.path.getsize(app.video_path)
-            start, end = 0, size - 1
-            match = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
-            if match:
-                if match.group(1):
-                    start = int(match.group(1))
-                    end = int(match.group(2)) if match.group(2) else size - 1
-                else:
-                    start = size - int(match.group(2))
-                end = min(end, size - 1)
-                self.send_response(206)
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            else:
-                self.send_response(200)
-            self.send_header("Content-Type", mimetypes.guess_type(app.video_path)[0] or "video/mp4")
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(end - start + 1))
-            self.end_headers()
-            with open(app.video_path, "rb") as file:
-                file.seek(start)
-                remaining = end - start + 1
-                try:
-                    while remaining > 0:
-                        chunk = file.read(min(1 << 20, remaining))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        remaining -= len(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass  # the browser cancels ranges it no longer needs
 
     return Handler
 

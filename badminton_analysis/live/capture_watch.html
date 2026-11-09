@@ -96,6 +96,7 @@
   <section>
     <h2 id="calls-title">Line calls</h2>
     <p id="no-calls" class="muted">Once the court is marked, each rally's call appears here about 3 s after the shuttle lands.</p>
+    <p><a id="review-link" href="/review" target="_blank" hidden>Review the rallies: replay, touch-down close-up and score ›</a></p>
     <ol id="calls"></ol>
   </section>
   <section id="combined-section" hidden>
@@ -166,6 +167,8 @@ function render(status) {
                                        (session.tracking && session.tracking.error) || ''].join('\n').trim() : '';
   const calls = session ? session.calls : [];
   $('calls-title').textContent = phones.length > 1 && phone ? `Line calls · ${phone.name}` : 'Line calls';
+  $('review-link').hidden = !session;
+  $('review-link').href = withPhone('/review');
   $('no-calls').hidden = calls.length > 0;
   $('calls').replaceChildren(...calls.slice().reverse().map(callItem));
   const combined = status.combined;
