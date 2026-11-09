@@ -59,6 +59,14 @@ const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const key = params.get('k') || '';
 const testPattern = params.has('test');
+// Kept by this browser, so the computer tells this phone from a second one filming from another angle.
+const phoneId = (() => {
+  const made = Math.random().toString(36).slice(2, 10);
+  try {
+    if (!localStorage.getItem('good-badminton-phone')) localStorage.setItem('good-badminton-phone', made);
+    return localStorage.getItem('good-badminton-phone');
+  } catch (error) { return made; }
+})();
 let stream = null, recorder = null, session = null, seq = 0, sent = 0, startedAt = 0;
 let sending = false, stopping = false, wakeLock = null;
 const queue = [];
@@ -181,7 +189,7 @@ async function start() {
     const bitrate = Math.round(Math.min(16e6, Math.max(3e6, width * height * fps * 0.1)));
     ({session} = await api('api/start', JSON.stringify({
       camera: testPattern ? 'Test pattern' : track.label, width, height, fps, mime, bitrate, zoom: settings.zoom || null,
-      user_agent: navigator.userAgent,
+      user_agent: navigator.userAgent, phone: testPattern ? 'test pattern' : phoneId,
     })));
     recorder = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: bitrate});
     seq = 0; sent = 0; stopping = false; queue.length = 0;
@@ -268,11 +276,13 @@ setInterval(async () => {
   // Confirms the computer is receiving and decoding.
   if (!recording()) { $('remote').textContent = ''; return; }
   try {
-    const response = await fetch('api/status', {headers: {'X-Key': key}});
+    const response = await fetch('api/status?s=' + encodeURIComponent(session), {headers: {'X-Key': key}});
     const status = await response.json();
     const current = status.session;
+    // With a second phone, say which one this is on the computer's page.
+    const name = status.phones.length > 1 && current ? `${current.info.phone_name} · ` : '';
     $('remote').textContent = current && current.frames
-      ? `Computer: ${current.frames} frames, ${current.delay} s behind` : 'Computer: waiting for video';
+      ? `${name}Computer: ${current.frames} frames, ${current.delay} s behind` : 'Computer: waiting for video';
   } catch (error) {
     $('remote').textContent = 'Computer: not reachable';
   }

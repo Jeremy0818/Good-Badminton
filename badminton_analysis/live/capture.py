@@ -8,6 +8,10 @@ computer saves the recording and decodes it while it arrives:
 
 Open http://127.0.0.1:8080 on this computer. It shows the address to open on
 the phone. Recordings go to recordings/<date-time>/recording.mp4.
+
+Several phones can film at once, each from its own angle: open the same
+address on each. Each phone's court is marked and tracked on its own, and the
+calls of phones filming together are combined (analysis/multi_camera.py).
 """
 
 import argparse
@@ -31,6 +35,7 @@ import cv2
 import numpy as np
 
 from ..analysis.line_calls import LiveLineCaller
+from ..analysis.multi_camera import COMBINED_CALLS, combine, write_combined
 from ..court.mapper import resolve_court_corners
 from ..data.writer import JsonlDetectionWriter
 from .tracker import LIVE_CALLS, LIVE_DETECTIONS, LiveTracker
@@ -151,6 +156,10 @@ class CaptureSession:
             if self.stopped is None:
                 self.stopped = time.time()
         self.write_info()
+
+    def stale(self, after=20.0):
+        """No piece for `after` seconds: the phone's page was probably closed or lost the network."""
+        return time.time() - (self.last_piece or self.started) > after
 
     def finish(self):
         """Rewrite the stream as a normal video file that players and the review page can seek in."""
@@ -274,14 +283,30 @@ def to_bgr(yuv):
     return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
 
 
+# PyTorch's MPS backend is not safe to use from two threads at once, so with several phones their networks take
+# turns; the rest of each phone's tracking still runs alongside.
+GPU = threading.Lock()
+
+
+def _one_at_a_time(function):
+    def run(*args, **kwargs):
+        with GPU:
+            return function(*args, **kwargs)
+    return run
+
+
 def load_models():
-    """TrackNet and the pose model, as the live tracker uses them. Loaded when the court is first marked."""
+    """TrackNet and the pose model, as the live tracker uses them. Each phone gets its own, as TrackNet keeps the
+    phone's empty court picture; they are loaded when its court is first marked."""
     from ..detection.tracknet import DEFAULT_WEIGHTS, TrackNetTracker, pick_device
     from ..detection.yolo_pose import YOLOPoseProcessor
     from ..visualization.player_pose import PlayerPoseVisualizer
-    pose = PlayerPoseVisualizer(YOLOPoseProcessor(model_path="weights/yolo11n-pose.pt", device=pick_device()),
-                                show_skeletons=False, show_player_trajectories=False)
-    return TrackNetTracker(DEFAULT_WEIGHTS), pose
+    processor = YOLOPoseProcessor(model_path="weights/yolo11n-pose.pt", device=pick_device())
+    processor.process_frame = _one_at_a_time(processor.process_frame)
+    pose = PlayerPoseVisualizer(processor, show_skeletons=False, show_player_trajectories=False)
+    tracknet = TrackNetTracker(DEFAULT_WEIGHTS)
+    tracknet._heatmaps = _one_at_a_time(tracknet._heatmaps)
+    return tracknet, pose
 
 
 class LiveCalls(threading.Thread):
@@ -290,8 +315,9 @@ class LiveCalls(threading.Thread):
     frames leaves little time to spare, so it falls behind while the court picture TrackNet needs is
     first built; frames beyond `backlog` seconds behind are dropped rather than kept waiting."""
 
-    def __init__(self, session, court, models, backlog=5.0, every_frame=False):
+    def __init__(self, session, court, models, backlog=5.0, every_frame=False, on_calls=None):
         super().__init__(daemon=True)
+        self.on_calls = on_calls   # called from this thread after each new call
         tracknet, pose = models
         tracknet.background = None   # left from an earlier recording
         metadata = {"video": {"fps": session.fps, "width": court["size"][0], "height": court["size"][1]},
@@ -357,32 +383,72 @@ class LiveCalls(threading.Thread):
                     if calls:
                         with open(os.path.join(session.folder, LIVE_CALLS), "w", encoding="utf-8") as file:
                             json.dump([asdict(call) for call in session.calls], file, indent=1)
+                        if self.on_calls:
+                            self.on_calls()
                     if item is None:
                         break
         except Exception as error:   # shown on the page; recording goes on
             self.error = f"tracking stopped: {error!r}"
 
 
+class Phone:
+    """A phone filming the court, or this computer's camera: its latest recording, and what is kept while it
+    stays put, the court marked on its picture."""
+
+    def __init__(self, phone_id, number):
+        self.id = phone_id
+        self.number = number
+        self.name = f"Phone {number}"
+        self.session = None       # its current or latest recording
+        self.decoder = None
+        self.preview = None       # JPEG of the latest decoded frame
+        self.preview_time = 0.0
+        self.frame = None         # the latest decoded frame, at preview time
+        self.court_frame = None   # the frame the court is being marked on
+        self.court = None         # corners etc. as in metadata.json's "court"; kept while the phone stays put
+        self.models = None        # its TrackNet and pose, loaded when its court is first marked
+
+    @property
+    def recording(self):
+        return self.session is not None and self.session.stopped is None
+
+
 class CaptureApp:
+    """Phones filming at the same time each record and are tracked on their own. Once two or more of them make
+    calls, the calls are combined (analysis/multi_camera.py)."""
+
     def __init__(self, out_dir, key, phone_urls=(), every_frame=False):
         self.out_dir = out_dir
         self.every_frame = every_frame   # see LiveCalls
         self.key = key
         self.phone_urls = list(phone_urls)
-        self.session = None
-        self.decoder = None
-        self.preview = None   # JPEG of the latest decoded frame
-        self.preview_time = 0.0
-        self.frame = None         # the latest decoded frame, at preview time
-        self.court_frame = None   # the frame the court is being marked on
-        self.court = None         # corners etc. as in metadata.json's "court"; kept while the phone stays put
-        self.models = None        # TrackNet and pose, loaded when the court is first marked
+        self.phones = {}         # by the id each phone's page keeps, in the order they first connected
+        self.combined = None     # (calls, alignment, fps) of the phones filming together
+        self.combine_error = None
         self.lock = threading.Lock()
+        self.combine_lock = threading.Lock()
+
+    def phone(self, phone_id=None):
+        """The phone with this id; without one, the phone that started recording last."""
+        if phone_id is None:
+            if not self.phones:
+                raise LookupError("no picture from a phone yet")
+            started = [phone for phone in self.phones.values() if phone.session is not None]
+            return max(started, key=lambda phone: phone.session.started) if started else next(iter(self.phones.values()))
+        try:
+            return self.phones[phone_id]
+        except KeyError:
+            raise LookupError(f"no phone {phone_id}") from None
 
     def start(self, info):
         with self.lock:
-            if self.session is not None and self.session.stopped is None:
-                self._stop(self.session)  # the phone started again without stopping
+            phone_id = str(info.get("phone") or "phone")   # pages from before several phones send no id
+            phone = self.phones.get(phone_id)
+            if phone is None:
+                phone = self.phones[phone_id] = Phone(phone_id, len(self.phones) + 1)
+            for other in self.phones.values():
+                if other.recording and (other is phone or other.session.stale()):
+                    self._stop(other.session)   # started again without stopping, or its page was closed
             name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             folder = os.path.join(self.out_dir, name)
             suffix = 1
@@ -390,32 +456,60 @@ class CaptureApp:
                 suffix += 1
                 folder = os.path.join(self.out_dir, f"{name}-{suffix}")
             os.makedirs(folder)
-            session = CaptureSession(folder, info)
-            self.session = session
-            self.preview = None
-            self.decoder = StreamDecoder(session.path, session.fps,
-                                         lambda index, yuv: self._on_frame(session, index, yuv),
-                                         finished=lambda: session.stopped is not None,
-                                         ended=lambda: session.live and session.live.end())
-            self.decoder.start()
-            if self.court:
-                self._track(session)   # the phone is back where the court was marked; if not, mark it again
+            session = CaptureSession(folder, {**info, "phone_name": phone.name})
+            phone.session = session
+            phone.preview = None
+            phone.decoder = StreamDecoder(session.path, session.fps,
+                                          lambda index, yuv: self._on_frame(phone, session, index, yuv),
+                                          finished=lambda: session.stopped is not None,
+                                          ended=lambda: session.live and session.live.end())
+            phone.decoder.start()
+            if phone.court:
+                self._track(phone, session)   # the phone is back where its court was marked; if not, mark it again
             return session.id
 
-    def _track(self, session):
+    def _track(self, phone, session):
         """Follow the shuttle and call the lines on this recording's frames from now on."""
         if session.live is not None:
             session.live.end()
-        if self.models is None:
-            self.models = load_models()
-        session.live = LiveCalls(session, self.court, self.models, every_frame=self.every_frame)
+        if phone.models is None:
+            phone.models = load_models()
+        session.live = LiveCalls(session, phone.court, phone.models, every_frame=self.every_frame,
+                                 on_calls=self._combine)
         session.live.start()
 
+    def _together(self):
+        """The phones tracking now whose recordings overlap the first such phone's, first phone first."""
+        tracked = [phone for phone in self.phones.values() if phone.session is not None and phone.session.live]
+        if not tracked:
+            return []
+        first, now = tracked[0].session, time.time()
+        return [phone for phone in tracked
+                if phone.session.started < (first.stopped or now) and (phone.session.stopped or now) > first.started]
+
+    def _combine(self):
+        """Combine the calls of the phones filming together and save them next to the first one's recording.
+        Called from each phone's tracking thread when it makes a call."""
+        with self.combine_lock:
+            try:
+                together = self._together()
+                if len(together) < 2:
+                    return
+                cameras = [{"name": phone.name, "calls": list(phone.session.calls), "fps": phone.session.fps,
+                            "started": phone.session.started, "folder": phone.session.folder} for phone in together]
+                config = together[0].session.live.caller.config
+                calls, alignment = combine(cameras, config)
+                write_combined(os.path.join(together[0].session.folder, COMBINED_CALLS), calls, alignment, cameras,
+                               config)
+                self.combined, self.combine_error = (calls, alignment, together[0].session.fps), None
+            except Exception as error:   # shown on the page; each phone's own calls go on
+                self.combine_error = f"combining stopped: {error!r}"
+
     def _session(self, session_id):
-        session = self.session
-        if session is None or session.id != session_id:
-            raise LookupError(f"no recording {session_id}")
-        return session
+        for phone in self.phones.values():
+            if phone.session is not None and phone.session.id == session_id:
+                return phone.session
+        raise LookupError(f"no recording {session_id}")
 
     def add_piece(self, session_id, seq, data):
         session = self._session(session_id)
@@ -432,60 +526,73 @@ class CaptureApp:
             session.stop()
             threading.Thread(target=session.finish, daemon=True).start()
 
-    def _on_frame(self, session, index, yuv):
+    def _on_frame(self, phone, session, index, yuv):
         if session.live is not None:
             session.live.add(index, yuv)
         now = time.time()
-        if session is not self.session or now - self.preview_time < PREVIEW_EVERY:
+        if session is not phone.session or now - phone.preview_time < PREVIEW_EVERY:
             return
-        self.preview_time = now
+        phone.preview_time = now
         frame = to_bgr(yuv)
-        self.frame = frame
+        phone.frame = frame
         height, width = frame.shape[:2]
         small = cv2.resize(frame, (640, max(2, round(height * 640 / width))), interpolation=cv2.INTER_AREA)
         ok, jpeg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if ok:
-            self.preview = jpeg.tobytes()
+            phone.preview = jpeg.tobytes()
 
-    def suggest_court(self):
-        """Hold the latest picture to mark the court on, with the court's corners if they can be found in it."""
-        frame = self.frame
+    def preview(self, phone_id=None):
+        """JPEG of the phone's latest picture, if there is one."""
+        try:
+            return self.phone(phone_id).preview
+        except LookupError:
+            return None
+
+    def suggest_court(self, phone_id=None):
+        """Hold the phone's latest picture to mark the court on, with the court's corners if they can be found."""
+        phone = self.phone(phone_id)
+        frame = phone.frame
         if frame is None:
             raise LookupError("no picture from the phone yet")
-        self.court_frame = frame
+        phone.court_frame = frame
         corners, _, _ = resolve_court_corners(frame)
         height, width = frame.shape[:2]
         return {"size": [width, height], "corners": [[int(x), int(y)] for x, y in corners] if corners else None}
 
-    def court_picture(self):
-        if self.court_frame is None:
+    def court_picture(self, phone_id=None):
+        try:
+            frame = self.phone(phone_id).court_frame
+        except LookupError:
             return None
-        ok, jpeg = cv2.imencode(".jpg", self.court_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if frame is None:
+            return None
+        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return jpeg.tobytes() if ok else None
 
-    def set_court(self, corners):
-        """The corners of the doubles court on the held picture, going round from one end of a baseline. The
-        picture is kept too: the live tracker compares frames with it to notice when the view changes."""
-        frame = self.court_frame
+    def set_court(self, corners, phone_id=None):
+        """The corners of the doubles court on the phone's held picture, going round from one end of a baseline.
+        The picture is kept too: the live tracker compares frames with it to notice when the view changes."""
+        phone = self.phone(phone_id)
+        frame = phone.court_frame
         if frame is None:
             raise LookupError("no picture held to mark the court on")
         if len(corners) != 4 or any(len(corner) != 2 for corner in corners):
             raise ValueError("expected 4 corners")
         corners, roi_corners, mid_height = resolve_court_corners(frame, manual_corners=corners)
-        folder = self.session.folder if self.session else self.out_dir
+        folder = phone.session.folder if phone.session else self.out_dir
         template = os.path.join(folder, "court.jpg")
         cv2.imwrite(template, frame)
         height, width = frame.shape[:2]
-        self.court = {"corners": [list(corner) for corner in corners], "roi_corners": [list(c) for c in roi_corners],
-                      "mid_height": int(mid_height), "template_path": template, "size": [width, height]}
+        phone.court = {"corners": [list(corner) for corner in corners], "roi_corners": [list(c) for c in roi_corners],
+                       "mid_height": int(mid_height), "template_path": template, "size": [width, height]}
         with open(os.path.join(folder, "court.json"), "w", encoding="utf-8") as file:
-            json.dump(self.court, file, indent=2)
-        if self.session is not None and self.session.stopped is None:
-            self._track(self.session)
-        return self.court
+            json.dump(phone.court, file, indent=2)
+        if phone.recording:
+            self._track(phone, phone.session)
+        return phone.court
 
-    def status(self):
-        session, decoder = self.session, self.decoder
+    def _phone_status(self, phone):
+        session, decoder = phone.session, phone.decoder
         current = None
         if session is not None:
             current = session.summary()
@@ -503,8 +610,44 @@ class CaptureApp:
                            "landing_sec": round(call.landing_frame / session.fps, 1), "confidence": call.confidence}
                           for call in session.calls],
             })
-        return {"phone_urls": self.phone_urls, "recording": bool(session and session.stopped is None),
-                "session": current, "recordings": self.recordings(), "court": self.court}
+        return {"id": phone.id, "name": phone.name, "recording": phone.recording, "session": current,
+                "court": phone.court}
+
+    def _combined_status(self):
+        if self.combined is None:
+            return {"calls": [], "phones": []}
+        calls, alignment, fps = self.combined
+
+        def error(value):
+            return max(value) if value else None
+
+        return {"phones": alignment, "calls": [{
+            "rally": call.rally, "call": call.call, "margin_m": call.margin_m, "error_m": error(call.landing_error_m),
+            "landing_sec": round(call.landing_frame / fps if call.landing_frame is not None else call.end_sec, 1),
+            "confidence": call.confidence,
+            # the combining's own notes; each phone's are on its own calls
+            "flags": [flag for flag in call.flags if not any(flag.startswith(seen["camera"] + ": ")
+                                                             for seen in call.cameras)],
+            "phones": [{"name": seen["camera"], "call": seen["call"], "margin_m": seen["margin_m"],
+                        "error_m": error(seen["landing_error_m"])} for seen in call.cameras],
+        } for call in calls]}
+
+    def status(self, session_id=None):
+        """Every phone's recording and court, and the calls combined from the phones filming together.
+        "session" and "court" are those of recording session_id (a phone's page asks for its own), else of the
+        phone that started recording last."""
+        phones = [self._phone_status(phone) for phone in self.phones.values()]
+        current = next((item for item in phones if item["session"] and item["session"]["id"] == session_id), None)
+        if current is None and phones:
+            try:
+                latest = self.phone().id
+                current = next(item for item in phones if item["id"] == latest)
+            except LookupError:
+                pass
+        return {"phone_urls": self.phone_urls, "recording": any(item["recording"] for item in phones),
+                "phones": phones, "session": current and current["session"], "court": current and current["court"],
+                "combined": self._combined_status(), "combine_error": self.combine_error,
+                "recordings": self.recordings()}
 
     def recordings(self):
         items = []
@@ -516,7 +659,9 @@ class CaptureApp:
                     info = json.load(file)
             except (OSError, ValueError):
                 continue
-            items.append({key: info.get(key) for key in ("id", "seconds", "bytes", "saved_path", "error")})
+            item = {key: info.get(key) for key in ("id", "seconds", "bytes", "saved_path", "error")}
+            item["phone"] = (info.get("info") or {}).get("phone_name")
+            items.append(item)
         return items
 
 
@@ -554,21 +699,24 @@ def make_handler(app, phone):
                 self._send(200, file.read(), "text/html; charset=utf-8")
 
         def do_GET(self):
-            path = urlparse(self.path).path
+            url = urlparse(self.path)
+            path = url.path
+            query = {key: values[0] for key, values in parse_qs(url.query).items()}
             if path in ("/", "/index.html"):
                 self._page(PHONE_PAGE if phone else WATCH_PAGE)
             elif path == "/camera" and not phone:
                 self._page(PHONE_PAGE)  # film with this computer's own camera, or ?test=1 for a test pattern
             elif path == "/api/status":
                 if self._allowed():
-                    self._json(app.status())
+                    self._json(app.status(query.get("s")))
             elif path == "/preview.jpg" and not phone:
-                if app.preview:
-                    self._send(200, app.preview, "image/jpeg")
+                picture = app.preview(query.get("phone"))
+                if picture:
+                    self._send(200, picture, "image/jpeg")
                 else:
                     self._send(404, b"no picture yet", "text/plain")
             elif path == "/court.jpg" and not phone:
-                picture = app.court_picture()
+                picture = app.court_picture(query.get("phone"))
                 if picture:
                     self._send(200, picture, "image/jpeg")
                 else:
@@ -598,9 +746,9 @@ def make_handler(app, phone):
                     app.stop(query["s"])
                     self._json({"stopped": True})
                 elif url.path == "/api/court/suggest" and not phone:
-                    self._json(app.suggest_court())
+                    self._json(app.suggest_court(query.get("phone")))
                 elif url.path == "/api/court" and not phone:
-                    self._json({"court": app.set_court(json.loads(body)["corners"])})
+                    self._json({"court": app.set_court(json.loads(body)["corners"], query.get("phone"))})
                 else:
                     self._send(404, b"not found", "text/plain")
             except LookupError as error:
@@ -631,9 +779,10 @@ class TLSServer(ThreadingHTTPServer):
         super().finish_request(request, client_address)
 
 
-def replay_as_phone(app, video, start=0.0, seconds=None):
-    """Send a saved video to the app as the phone would, at its own speed, to try the live steps without a
-    phone. ffmpeg re-encodes it as the fragmented MP4 that Safari records, one fragment a second."""
+def replay_as_phone(app, video, start=0.0, seconds=None, phone="replay"):
+    """Send a saved video to the app as a phone would, at its own speed, to try the live steps without a
+    phone. ffmpeg re-encodes it as the fragmented MP4 that Safari records, one fragment a second. Each phone
+    id replays as a phone of its own."""
     probe = cv2.VideoCapture(video)
     fps = probe.get(cv2.CAP_PROP_FPS) or 30.0
     size = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH)), int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -644,7 +793,7 @@ def replay_as_phone(app, video, start=0.0, seconds=None):
     command += ["-an", "-c:v", "libx264", "-preset", "veryfast", "-g", str(round(fps)), "-f", "mp4",
                 "-movflags", "frag_keyframe+empty_moov+default_base_moof", "pipe:1"]
     session = app.start({"camera": f"replay of {os.path.basename(video)}", "width": size[0], "height": size[1],
-                         "fps": fps, "mime": "video/mp4"})
+                         "fps": fps, "mime": "video/mp4", "phone": phone})
     process = subprocess.Popen(command, stdout=subprocess.PIPE)
     seq = 0
     while data := process.stdout.read1(1 << 20):
@@ -654,7 +803,7 @@ def replay_as_phone(app, video, start=0.0, seconds=None):
     app.stop(session)
 
 
-def serve(out_dir="recordings", phone_port=8443, local_port=8080, replay=None, every_frame=False):
+def serve(out_dir="recordings", phone_port=8443, local_port=8080, replays=(), every_frame=False):
     tls_dir = os.path.join(out_dir, ".tls")
     address, hostname = lan_address(), local_hostname()
     cert, key_file = ensure_certificate(tls_dir, [address, hostname, "localhost"])
@@ -674,16 +823,17 @@ def serve(out_dir="recordings", phone_port=8443, local_port=8080, replay=None, e
         print(f"  {url}")
     print("The phone warns that the connection is not private once: Show Details > visit this website.")
     print("Ctrl+C to stop")
-    if replay:
-        threading.Thread(target=replay_as_phone, args=(app, *replay), daemon=True).start()
+    for number, replay in enumerate(replays, 1):
+        threading.Thread(target=replay_as_phone, args=(app, *replay, f"replay {number}"), daemon=True).start()
     try:
         phone_server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        if app.session is not None and app.session.stopped is None:
-            app.session.stop()
-            app.session.finish()
+        for phone in app.phones.values():
+            if phone.recording:
+                phone.session.stop()
+                phone.session.finish()
         phone_server.server_close()
         local_server.shutdown()
 
@@ -693,15 +843,22 @@ def main():
     parser.add_argument("--out", default="recordings", help="Folder for recordings")
     parser.add_argument("--phone-port", type=int, default=8443)
     parser.add_argument("--port", type=int, default=8080, help="Port of the status page on this computer")
-    parser.add_argument("--replay", help="Send this video as if a phone were filming it, to try without a phone")
-    parser.add_argument("--start", type=float, default=0.0, help="Second of the --replay video to start at")
-    parser.add_argument("--seconds", type=float, default=None, help="Seconds of the --replay video to send")
+    parser.add_argument("--replay", nargs="+", metavar="VIDEO",
+                        help="Send these videos as if phones were filming them, a phone each, to try without a phone")
+    parser.add_argument("--start", type=float, nargs="+", default=[0.0],
+                        help="Second of the --replay videos to start at: one for all, or one each")
+    parser.add_argument("--seconds", type=float, default=None, help="Seconds of the --replay videos to send")
     parser.add_argument("--every-frame", action="store_true",
                         help="Track every frame, even one that does not look like the marked court, as for a phone: "
                              "a --replay of a broadcast then puts on the load of a phone")
     args = parser.parse_args()
-    serve(args.out, args.phone_port, args.port, (args.replay, args.start, args.seconds) if args.replay else None,
-          args.every_frame)
+    replays = []
+    if args.replay:
+        starts = args.start * len(args.replay) if len(args.start) == 1 else args.start
+        if len(starts) != len(args.replay):
+            parser.error("give one --start for all --replay videos, or one each")
+        replays = [(video, start, args.seconds) for video, start in zip(args.replay, starts)]
+    serve(args.out, args.phone_port, args.port, replays, args.every_frame)
 
 
 if __name__ == "__main__":

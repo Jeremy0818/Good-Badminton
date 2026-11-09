@@ -37,8 +37,11 @@
   .buttons { display: flex; gap: 8px; margin-top: 10px; }
   .buttons button { font-size: 14px; padding: 5px 12px; }
   .buttons button:disabled { opacity: 0.5; cursor: default; }
-  #calls { margin: 0; padding: 0; list-style: none; }
-  #calls li { padding: 6px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  #calls, #combined { margin: 0; padding: 0; list-style: none; }
+  #calls li, #combined li { padding: 6px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+  .tabs button { font-size: 14px; padding: 5px 12px; }
+  .tabs button.selected { border-color: var(--text); font-weight: 600; }
   .warning { color: var(--red); font-weight: 600; }
   b.in { color: var(--green); }
   b.out { color: var(--red); }
@@ -62,8 +65,11 @@
     <p class="muted">The phone needs the same Wi-Fi as this computer. At a hall, turn on the iPhone's Personal Hotspot
       and join this computer to it (video stays local and uses no mobile data). Safari warns once that the connection
       is not private: Show Details › visit this website. Hold the phone sideways and keep it on a stand.
+      To film from another angle too, open the same address on a second phone and mark its court as well: the calls
+      of phones filming together are combined, each landing placed mostly by the phone nearest it.
       To try without a phone: <a href="/camera">this computer's camera</a> or <a href="/camera?test=1">test pattern</a>.</p>
   </section>
+  <div id="phones" class="tabs" hidden></div>
   <section id="live">
     <div class="frame"><span>No video yet</span><img id="picture" alt="Latest picture received from the phone"><svg id="live-svg"></svg></div>
     <div>
@@ -88,13 +94,18 @@
     </div>
   </section>
   <section>
-    <h2>Line calls</h2>
+    <h2 id="calls-title">Line calls</h2>
     <p id="no-calls" class="muted">Once the court is marked, each rally's call appears here about 3 s after the shuttle lands.</p>
     <ol id="calls"></ol>
   </section>
+  <section id="combined-section" hidden>
+    <h2>Combined calls</h2>
+    <p id="combined-state" class="muted"></p>
+    <ol id="combined"></ol>
+  </section>
   <section>
     <h2>Recordings</h2>
-    <table><thead><tr><th>Started</th><th>Length</th><th>Size</th><th>File</th></tr></thead><tbody id="list"></tbody></table>
+    <table><thead><tr><th>Started</th><th>Phone</th><th>Length</th><th>Size</th><th>File</th></tr></thead><tbody id="list"></tbody></table>
   </section>
 </main>
 <script>
@@ -118,16 +129,30 @@ function render(status) {
       return row;
     }));
   }
-  const session = status.session;
-  $('state').textContent = status.recording ? 'Recording' : session ? 'Stopped' : 'Waiting for the phone';
-  $('state').className = status.recording ? 'rec' : '';
+  const phones = status.phones;
+  if (!phones.some(item => item.id === selected)) {
+    const shown = phones.find(item => item.recording) || phones[0];
+    selectPhone(shown ? shown.id : null);
+  }
+  const phone = phones.find(item => item.id === selected) || null;
+  $('phones').hidden = phones.length < 2;
+  $('phones').replaceChildren(...phones.map(item => {
+    const tab = Object.assign(document.createElement('button'), {textContent: item.name + (item.recording ? ' ●' : ''),
+                                                                 className: item.id === selected ? 'selected' : ''});
+    tab.onclick = () => { selectPhone(item.id); render(status); };
+    return tab;
+  }));
+  const session = phone && phone.session;
+  const recording = Boolean(phone && phone.recording);
+  $('state').textContent = recording ? 'Recording' : session ? 'Stopped' : 'Waiting for the phone';
+  $('state').className = recording ? 'rec' : '';
   const rows = session ? [
     ['Recording', session.id],
     ['Camera', `${session.info.camera || '?'} · ${session.info.width}×${session.info.height} @ ${session.fps} fps`],
     ['Length', clock(session.seconds)],
     ['Received', `${mb(session.bytes)} in ${session.pieces} pieces` + (session.gaps ? ` · ${session.gaps} missing` : '')],
     ['Decoded', `${session.frames} frames (${clock(session.decoded_seconds)})` + (session.size ? ` · ${session.size[0]}×${session.size[1]}` : '')],
-    ['Behind live', status.recording ? `${session.delay} s` : '–'],
+    ['Behind live', recording ? `${session.delay} s` : '–'],
     ['Tracking', session.tracking ? `${session.tracking.court_frames} court frames`
       + (session.tracking.behind >= 0.5 ? ` · ${session.tracking.behind} s behind` : '')
       + (session.tracking.dropped ? ` · ${session.tracking.dropped} frames dropped` : '') : 'once the court is marked'],
@@ -140,16 +165,26 @@ function render(status) {
   $('errors').textContent = session ? [...session.decoder_errors, session.error || '',
                                        (session.tracking && session.tracking.error) || ''].join('\n').trim() : '';
   const calls = session ? session.calls : [];
+  $('calls-title').textContent = phones.length > 1 && phone ? `Line calls · ${phone.name}` : 'Line calls';
   $('no-calls').hidden = calls.length > 0;
-  $('calls').replaceChildren(...calls.slice().reverse().map(call => {
-    const margin = Math.abs(call.margin_m);
-    const distance = margin < 1 ? `${Math.round(margin * 100)} cm` : `${margin.toFixed(2)} m`;
-    const item = document.createElement('li');
-    item.append(`Rally ${call.rally} · `, Object.assign(document.createElement('b'), {textContent: call.call.toUpperCase(), className: call.call}),
-                ` · ${distance} ${call.call === 'in' ? 'inside' : 'outside'} the line · landed at ${clock(call.landing_sec)}`);
+  $('calls').replaceChildren(...calls.slice().reverse().map(callItem));
+  const combined = status.combined;
+  $('combined-section').hidden = !combined.calls.length && !status.combine_error;
+  $('combined-state').textContent = status.combine_error || combined.phones.slice(1).map(item =>
+    `${item.camera}: ${item.offset_s >= 0 ? '+' : ''}${item.offset_s.toFixed(1)} s against ${combined.phones[0].camera}, `
+    + `court ${item.turn}, ${item.matched} ${item.matched === 1 ? 'rally' : 'rallies'} matched`).join(' · ');
+  $('combined').replaceChildren(...combined.calls.slice().reverse().map(call => {
+    const item = callItem(call);
+    const seen = call.phones.map(each => `${each.name} ${each.call.toUpperCase()} ${distance(each.margin_m)}`
+                                         + (each.error_m ? ` ±${distance(each.error_m)}` : '')).join(' · ');
+    item.append(Object.assign(document.createElement('div'), {className: 'muted', textContent: seen}));
+    for (const flag of call.flags) {
+      item.append(Object.assign(document.createElement('div'),
+                                {className: flag.startsWith('phones disagree') ? 'warning' : 'muted', textContent: flag}));
+    }
     return item;
   }));
-  court = status.court;
+  court = phone && phone.court;
   $('mark').disabled = !session;
   const moved = session && session.tracking && session.tracking.moved;
   if ($('marking').hidden) {
@@ -164,23 +199,47 @@ function render(status) {
   else $('live-svg').replaceChildren();
   $('list').replaceChildren(...status.recordings.map(item => {
     const row = document.createElement('tr');
-    const live = status.recording && session && item.id === session.id;
-    row.append(cell(started(item.id)), cell(clock(item.seconds || 0)), cell(mb(item.bytes || 0)),
+    const live = phones.some(each => each.recording && each.session.id === item.id);
+    row.append(cell(started(item.id)), cell(item.phone || ''), cell(clock(item.seconds || 0)), cell(mb(item.bytes || 0)),
                cell(item.error ? 'error: ' + item.error : item.saved_path || (live ? 'recording…' : 'not finished')));
     return row;
   }));
+}
+
+function distance(meters) {
+  const value = Math.abs(meters);
+  return value < 1 ? `${Math.round(value * 100)} cm` : `${value.toFixed(2)} m`;
+}
+
+function callItem(call) {
+  const item = document.createElement('li');
+  item.append(`Rally ${call.rally} · `, Object.assign(document.createElement('b'), {textContent: call.call.toUpperCase(), className: call.call}),
+              ` · ${distance(call.margin_m)} ${call.call === 'in' ? 'inside' : 'outside'} the line · landed at ${clock(call.landing_sec)}`);
+  return item;
+}
+
+let selected = null;   // id of the phone shown
+const withPhone = path => selected ? `${path}${path.includes('?') ? '&' : '?'}phone=${encodeURIComponent(selected)}` : path;
+
+function selectPhone(id) {
+  if (id === selected) return;
+  selected = id;
+  marking = null;
+  showMarking(false);
+  $('picture').removeAttribute('src');
 }
 
 async function refresh() {
   let status = null;
   try { status = await (await fetch('api/status')).json(); render(status); }
   catch (error) { $('state').textContent = 'Server stopped'; }
-  const live = Boolean(status && status.recording);
+  const phone = status && status.phones.find(item => item.id === selected);
+  const live = Boolean(phone && phone.recording);
   // While recording, a new picture every half second; afterwards keep the last one.
-  if (live || (status && status.session && !$('picture').getAttribute('src'))) {
-    $('picture').src = 'preview.jpg?t=' + Date.now();
+  if (live || (phone && phone.session && !$('picture').getAttribute('src'))) {
+    $('picture').src = withPhone('preview.jpg?t=' + Date.now());
   }
-  setTimeout(refresh, live ? 500 : 1500);
+  setTimeout(refresh, status && status.recording ? 500 : 1500);
 }
 $('picture').onerror = () => $('picture').removeAttribute('src');
 
@@ -256,12 +315,12 @@ function showMarking(on) {
 }
 
 async function holdPicture() {
-  const reply = await (await fetch('api/court/suggest', {method: 'POST'})).json();
+  const reply = await (await fetch(withPhone('api/court/suggest'), {method: 'POST'})).json();
   if (reply.error) { $('court-state').textContent = reply.error; return; }
   const [w, h] = reply.size;
   marking = {size: reply.size,
              corners: reply.corners || [[w * 0.35, h * 0.35], [w * 0.65, h * 0.35], [w * 0.8, h * 0.85], [w * 0.2, h * 0.85]]};
-  $('court-picture').src = 'court.jpg?t=' + Date.now();
+  $('court-picture').src = withPhone('court.jpg?t=' + Date.now());
   $('mark-frame').style.aspectRatio = `${w} / ${h}`;
   drawCourt($('mark-svg'), marking.size, marking.corners, true);
   $('court-state').textContent = reply.corners ? 'Found a court: check that the dots sit on its corners.'
@@ -288,7 +347,7 @@ $('again').onclick = holdPicture;
 $('cancel').onclick = () => { marking = null; showMarking(false); };
 $('use').onclick = async () => {
   const corners = marking.corners.map(point => point.map(Math.round));
-  const reply = await (await fetch('api/court', {method: 'POST', body: JSON.stringify({corners})})).json();
+  const reply = await (await fetch(withPhone('api/court'), {method: 'POST', body: JSON.stringify({corners})})).json();
   if (reply.error) { $('court-state').textContent = reply.error; return; }
   marking = null;
   showMarking(false);

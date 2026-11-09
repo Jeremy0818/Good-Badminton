@@ -358,6 +358,29 @@ Keep the phone still once the court is marked: a shift of a few pixels moves lan
 
 On an Apple M3 Pro it keeps up with a phone at 30 fps. The phone's frames are decoded at 720p; tracking every frame of the 60 s above, as for a phone, whose view never cuts away, took 17–27 ms of the 33 ms a frame lasts, dropped no frames and was never more than 2 s behind (the spread came from other apps using the computer at the time). 60 fps would not fit. To measure another computer, add `--every-frame` to the replay command; a broadcast's replays and close-ups are then tracked too and can give a stray call.
 
+### Several Phones (Experimental)
+
+One phone places a landing near its far baseline poorly: a pixel there spans several centimeters of court, so in a broadcast view a 3 px slip moves a far landing by about 12 cm. A second phone sees that end close up. To film from another angle, open the same address on a second phone, pick it with the tabs at the top of the computer's page, and mark its court too. Each phone is tracked on its own; once two of them make calls, the page also lists **combined calls**:
+
+- For each rally the phones' landing points are averaged, each weighted by how precisely that phone places it (one over its error squared), and the rally is called from the average. With a phone behind each baseline, each landing is placed mostly by the phone nearest it; a phone at the side by the net places distances from the baselines well.
+- Rallies are matched across phones by landing time. The phones' clocks are lined up from when each started filming, then by the shift that lines up most of their rallies.
+- Each phone's court is counted from the corner marked first, so a court marked from the other end is the same court turned around. The turn that brings the phones' landings together is found from the rallies.
+- Phones that place a landing more than 3 error-widths apart, or call it differently, leave it for review. A rally only one phone placed keeps that phone's call.
+
+Combined calls are written to `combined_line_calls.json` next to the first phone's recording, in that recording's frames and court. To combine phones afterwards, from analysed videos or capture recordings:
+
+```bash
+python -m badminton_analysis.analysis.multi_camera outputs/<phone 1> outputs/<phone 2>
+```
+
+To try it without phones, replay a video as two phones (the same view twice, so it only shows the steps working):
+
+```bash
+python -m badminton_analysis.live.capture --replay videos/<video>.mp4 videos/<video>.mp4 --start 638 640 --seconds 60
+```
+
+Each phone has its own models, and the computer does the work of both. On an Apple M3 Pro, two phones with every frame tracked (`--every-frame`) dropped no frames and were at most 3.6 s behind, against 1.8 s for one. The two phones' clocks were found to be 2.0 s apart, as replayed, and their rallies matched. Not yet tried on two real phones: every match used so far was filmed by one broadcast camera, so how much the combined calls gain is still to be measured.
+
 ## 📊 Outputs
 
 Default output directory: `outputs/<video_name>/`.
