@@ -290,12 +290,14 @@ class LiveCalls(threading.Thread):
     frames leaves little time to spare, so it falls behind while the court picture TrackNet needs is
     first built; frames beyond `backlog` seconds behind are dropped rather than kept waiting."""
 
-    def __init__(self, session, court, models, backlog=5.0):
+    def __init__(self, session, court, models, backlog=5.0, every_frame=False):
         super().__init__(daemon=True)
         tracknet, pose = models
         tracknet.background = None   # left from an earlier recording
         metadata = {"video": {"fps": session.fps, "width": court["size"][0], "height": court["size"][1]},
                     "court": court}
+        if every_frame:   # track frames that do not look like the marked court too, as a phone's always do
+            metadata["court"] = {key: value for key, value in court.items() if key != "template_path"}
         self.session = session
         self.tracker = LiveTracker(metadata, tracknet, pose, court_every=0.2)
         self.caller = LiveLineCaller(metadata)
@@ -362,8 +364,9 @@ class LiveCalls(threading.Thread):
 
 
 class CaptureApp:
-    def __init__(self, out_dir, key, phone_urls=()):
+    def __init__(self, out_dir, key, phone_urls=(), every_frame=False):
         self.out_dir = out_dir
+        self.every_frame = every_frame   # see LiveCalls
         self.key = key
         self.phone_urls = list(phone_urls)
         self.session = None
@@ -405,7 +408,7 @@ class CaptureApp:
             session.live.end()
         if self.models is None:
             self.models = load_models()
-        session.live = LiveCalls(session, self.court, self.models)
+        session.live = LiveCalls(session, self.court, self.models, every_frame=self.every_frame)
         session.live.start()
 
     def _session(self, session_id):
@@ -651,13 +654,13 @@ def replay_as_phone(app, video, start=0.0, seconds=None):
     app.stop(session)
 
 
-def serve(out_dir="recordings", phone_port=8443, local_port=8080, replay=None):
+def serve(out_dir="recordings", phone_port=8443, local_port=8080, replay=None, every_frame=False):
     tls_dir = os.path.join(out_dir, ".tls")
     address, hostname = lan_address(), local_hostname()
     cert, key_file = ensure_certificate(tls_dir, [address, hostname, "localhost"])
     key = access_key(tls_dir)
     urls = [f"https://{host}:{phone_port}/?k={key}" for host in (hostname, address)]
-    app = CaptureApp(out_dir, key, urls)
+    app = CaptureApp(out_dir, key, urls, every_frame=every_frame)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key_file)
@@ -693,8 +696,12 @@ def main():
     parser.add_argument("--replay", help="Send this video as if a phone were filming it, to try without a phone")
     parser.add_argument("--start", type=float, default=0.0, help="Second of the --replay video to start at")
     parser.add_argument("--seconds", type=float, default=None, help="Seconds of the --replay video to send")
+    parser.add_argument("--every-frame", action="store_true",
+                        help="Track every frame, even one that does not look like the marked court, as for a phone: "
+                             "a --replay of a broadcast then puts on the load of a phone")
     args = parser.parse_args()
-    serve(args.out, args.phone_port, args.port, (args.replay, args.start, args.seconds) if args.replay else None)
+    serve(args.out, args.phone_port, args.port, (args.replay, args.start, args.seconds) if args.replay else None,
+          args.every_frame)
 
 
 if __name__ == "__main__":
